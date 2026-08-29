@@ -27,6 +27,20 @@ from discord import app_commands
 from discord.ext import commands
 
 from .chat_logger import ChatLogger, BOT_UPLOAD_LIMIT
+from . import logs_api
+from .logs_api import (
+    LogsAPIError,
+    ZonianLogsClient,
+    build_day_document,
+    compress_and_split,
+    day_is_complete,
+    day_jst_range,
+    day_jst_range_text,
+    filter_messages_by_user,
+    get_safety_margin_hours,
+    make_base_name,
+    make_log_id,
+)
 
 
 # ---- Constants ----
@@ -35,7 +49,10 @@ CATEGORY_NAME = "Twitch Archives"             # 自動生成されるカテゴ�
 TRACKER_CHANNEL_NAME = "twitch-chat-tracker"  # トラッキングリスト管理用
 ARCHIVE_CHANNEL_NAME = "twitch-chat-archives"  # 保存用（Embed & ファイルのみの美しい本棚）
 DEDUP_CHANNEL_NAME = "twitch-chat-dedup"      # 重複判定記録用（Botの隠しJSONデータベース）
+LOGS_ARCHIVE_CHANNEL_NAME = "twitch-logs-archives"  # デイリーログ(zonian)保存用本棚
 TRACK_LIST_PREFIX = "📋 **Twitch配信者トラッキングリスト**"
+
+JST = logs_api.JST
 
 DESCRIPTION = (
     "Twitch Chat Logger Bot - Downloads Twitch VOD chat logs with emotes "
@@ -49,11 +66,14 @@ DESCRIPTION = (
     "`/chat track scan` - 登録配信者の全VODを一括スキャンDL\n"
     "`/chat migrate <ids>` - 旧チャンネル内の動画を新データベースへポインタ移行\n"
     "`/chat repair [targets] [excludes]` - 欠落パーツのVODを検出し自動修復DL\n"
+    "`/chat logs download <streamer>` - デイリーチャットログ(zonian)を1日ずつDL\n"
+    "`/chat logs days <streamer>` - DL可能日数・保存状況を表示\n"
     "`/chat list [streamer]` - アップロード済みVOD一覧\n"
     "`/chat status` - Botステータス確認\n"
     "`/chat sync` - データベース手動同期\n"
     "`/chat help` - ヘルプを表示\n\n"
     f"📌 **整理機能:** ログ本棚は `#{ARCHIVE_CHANNEL_NAME}`、回避用金庫は `#{DEDUP_CHANNEL_NAME}` に保存されます\n"
+    f"📌 **デイリーログ:** zonianの1日1ファイルは `#{LOGS_ARCHIVE_CHANNEL_NAME}` に保存 (確定済みの日のみ)\n"
     f"📌 **データ整合性:** 履歴スキャンの遡りリミットは完全にオフ（無制限）です"
 )
 
@@ -148,6 +168,54 @@ def _find_metadata_in_content(content: str) -> dict | None:
     return None
 
 
+def _find_log_metadata_in_content(content: str) -> dict | None:
+    """
+    メッセージ本文からデイリーログの重複回避メタデータJSONを抽出する。
+    形式: {"t":"logs","v":1,"ch":"orslok","u":"","d":"2026-08-27","n":479,"p":1,...}
+    """
+    if not content:
+        return None
+    candidates = []
+
+    try:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(content[start:end + 1])
+    except Exception:
+        pass
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            candidates.append(line)
+
+    for candidate in candidates:
+        try:
+            meta = json.loads(candidate)
+            if (
+                isinstance(meta, dict)
+                and meta.get("t") == "logs"
+                and meta.get("ch")
+                and meta.get("d")
+            ):
+                return {
+                    "log_id": make_log_id(str(meta["ch"]), meta.get("u", ""), str(meta["d"])),
+                    "channel_login": str(meta["ch"]),
+                    "channel_display_name": meta.get("sd", "") or str(meta["ch"]),
+                    "user_filter": meta.get("u", "") or "",
+                    "log_date": str(meta["d"]),
+                    "message_count": meta.get("n", 0),
+                    "total_parts": meta.get("p", 0),
+                    "compressed_size_bytes": meta.get("z", 0),
+                    "is_empty": meta.get("n", 0) == 0,
+                }
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+    return None
+
+
 # ---- Bot class ----
 
 class TwitchChatBot(commands.Bot):
@@ -169,6 +237,15 @@ class TwitchChatBot(commands.Bot):
         self._bot_start_time = time.time()
         self._scan_cache: dict[str, set[str]] = {}
         self._track_msg_cache: dict[str, int] = {}
+        self._logs_scan_cache: dict[str, set[str]] = {}
+        self._zonian: Optional[ZonianLogsClient] = None
+
+    @property
+    def zonian(self) -> ZonianLogsClient:
+        """logs.zonian.dev クライアント (遅延初期化)"""
+        if self._zonian is None:
+            self._zonian = ZonianLogsClient()
+        return self._zonian
 
     async def setup_hook(self):
         """スラッシュコマンドをDiscord APIに同期登録"""
@@ -186,6 +263,7 @@ class TwitchChatBot(commands.Bot):
             await self._get_or_create_tracker_channel(guild)
             await self._get_or_create_archive_channel(guild)
             await self._get_or_create_dedup_channel(guild)
+            await self._get_or_create_logs_archive_channel(guild)
         print("[✓] Slash commands ready! Type `/chat` in Discord to see commands.")
 
     # ---- Dedicated Categories & Channels ----
@@ -258,6 +336,34 @@ class TwitchChatBot(commands.Bot):
             print(f"[!] Failed to create dedup channel: {e}")
             return None
 
+    async def _get_or_create_logs_archive_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """デイリーチャットログ (logs.zonian.dev) 保存用チャンネル"""
+        if not guild:
+            return None
+        category = await self._get_or_create_category(guild)
+        if not category:
+            return None
+
+        for ch in category.text_channels:
+            if ch.name == LOGS_ARCHIVE_CHANNEL_NAME:
+                return ch
+
+        try:
+            if guild.me.guild_permissions.manage_channels:
+                channel = await guild.create_text_channel(
+                    name=LOGS_ARCHIVE_CHANNEL_NAME,
+                    category=category,
+                    topic="Twitchデイリーチャットログ保管庫（logs.zonian.dev / Zstd圧縮 / 1日1ファイル）",
+                )
+                print(f"[✓] Created logs archive channel: #{LOGS_ARCHIVE_CHANNEL_NAME}")
+                return channel
+            else:
+                print(f"[!] Missing 'Manage Channels' permission to create logs archive channel")
+                return None
+        except Exception as e:
+            print(f"[!] Failed to create logs archive channel: {e}")
+            return None
+
     async def _get_or_create_tracker_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
         category = await self._get_or_create_category(guild)
         if not category:
@@ -293,6 +399,7 @@ class TwitchChatBot(commands.Bot):
             return self._scan_cache[cid]
 
         vod_ids: set[str] = set()
+        log_ids: set[str] = set()
         count = 0
         print(f"[~] Scanning #{channel.name} ({channel.guild.name}) history (limit=None)...")
 
@@ -319,13 +426,42 @@ class TwitchChatBot(commands.Bot):
                             "emotes_providers": meta.get("emotes_providers", ""),
                             "is_partial": meta.get("is_partial", False),
                         })
+                    continue
+
+                # デイリーログ (zonian) の重複回避メタデータ
+                log_meta = _find_log_metadata_in_content(msg.content)
+                if log_meta:
+                    log_ids.add(log_meta["log_id"])
+                    if not self.logger.db.is_log_uploaded(log_meta["log_id"]):
+                        self.logger.db.record_log_upload(log_meta["log_id"], {
+                            "channel_login": log_meta["channel_login"],
+                            "channel_display_name": log_meta["channel_display_name"],
+                            "user_filter": log_meta["user_filter"],
+                            "log_date": log_meta["log_date"],
+                            "message_count": log_meta["message_count"],
+                            "total_parts": log_meta["total_parts"],
+                            "compressed_size_bytes": log_meta["compressed_size_bytes"],
+                            "discord_channel_id": cid,
+                            "discord_message_ids": [str(msg.id)],
+                            "is_empty": log_meta["is_empty"],
+                        })
         except discord.Forbidden:
             print(f"[!] Missing permission to read #{channel.name} history")
             return vod_ids
 
         self._scan_cache[cid] = vod_ids
-        print(f"[✓] Scanned #{channel.name}: {len(vod_ids)} unique VODs ({count} messages)")
+        self._logs_scan_cache[cid] = log_ids
+        print(f"[✓] Scanned #{channel.name}: {len(vod_ids)} unique VODs, {len(log_ids)} daily logs ({count} messages)")
         return vod_ids
+
+    async def _is_log_uploaded_in_channel(self, channel: discord.TextChannel, log_id: str) -> bool:
+        if self.logger.db.is_log_uploaded(log_id):
+            return True
+        cid = str(channel.id)
+        if cid in self._logs_scan_cache:
+            return log_id in self._logs_scan_cache[cid]
+        await self._scan_channel_for_uploads(channel)
+        return log_id in self._logs_scan_cache.get(cid, set())
 
     async def _is_vod_uploaded_in_channel(self, channel: discord.TextChannel, vod_id: str) -> bool:
         cid = str(channel.id)
@@ -793,6 +929,278 @@ class TwitchChatBot(commands.Bot):
 
         return new_parts
 
+    # ---- Daily Chat Logs (logs.zonian.dev) ----
+
+    async def _process_day_log(
+        self,
+        interaction: discord.Interaction,
+        channel_login: str,
+        channel_display: str,
+        channel_id: str,
+        day,
+        dest_channel: discord.TextChannel,
+        dedup_channel: discord.TextChannel,
+        user_filter: Optional[str] = None,
+        status_msg=None,
+        day_index: str = "",
+        profile_img: Optional[str] = None,
+    ) -> bool:
+        """1日分(UTC)のデイリーチャットログをDL→圧縮→アップロード→重複登録する。"""
+        start_time = time.time()
+        prefix = f"{day_index} " if day_index else ""
+        day_str = f"{day:%Y-%m-%d}"
+        log_id = make_log_id(channel_login, user_filter, day_str)
+        u_label = f" (user: {user_filter})" if user_filter else ""
+
+        try:
+            status_msg = await self._update_status(
+                interaction, status_msg,
+                f"{prefix}⬇️ `{channel_login}` {day_str}{u_label} ﾛｸﾞDL開始..."
+            )
+
+            # 1日分のチャットを取得 (イベントループをブロックしないようスレッドへ)
+            messages = await asyncio.to_thread(self.zonian.fetch_day, channel_login, day)
+
+            if user_filter:
+                messages = filter_messages_by_user(messages, user_filter)
+
+            message_count = len(messages)
+            parts: list[dict] = []
+
+            if message_count > 0:
+                document = build_day_document(
+                    channel_login, channel_id, channel_display, day, messages,
+                    user_filter=user_filter,
+                )
+                base_name = make_base_name(channel_login, day, user_filter)
+                parts = await asyncio.to_thread(compress_and_split, document, base_name)
+
+            total_size = sum(p["size"] for p in parts)
+            elapsed = time.time() - start_time
+
+            if message_count == 0:
+                # 0件の日も重複回避DBに登録する (VODの「チャットなし」と同じ方式)
+                embed = discord.Embed(
+                    title="📅 Twitch Daily Chat Log (0件)",
+                    description=(
+                        f"**チャンネル:** {channel_display} ({channel_login})\n"
+                        f"**日付:** {day_str} (UTC)\n"
+                        f"**JST範囲:** {day_jst_range_text(day)}\n"
+                        f"**メッセージ数:** 0件{u_label}\n"
+                        f"**ソース:** {logs_api.LOG_SOURCE_NAME}"
+                    ),
+                    color=0x9146FF,
+                )
+                embed.set_footer(text="Twitch Chat Logger")
+                embed.timestamp = datetime.now()
+                archive_msg = await dest_channel.send(
+                    content=f"📭 **[ログなし]** **{channel_display}** のデイリーログ {day_str} (UTC){u_label}",
+                    embed=embed,
+                )
+                message_ids = [str(archive_msg.id)]
+                dedup_msg_id = await self._post_log_dedup_entry(
+                    dedup_channel, channel_login, channel_display, channel_id,
+                    day, user_filter, 0, 0, 0, archive_msg,
+                )
+                if dedup_msg_id:
+                    message_ids.insert(0, dedup_msg_id)
+            else:
+                status_msg = await self._update_status(
+                    interaction, status_msg,
+                    f"{prefix}⬇️ `{channel_login}` {day_str} DL完了 "
+                    f"({message_count:,}件 / {_format_duration(int(elapsed))})\n"
+                    f"{prefix}📤 UP開始 -> #{dest_channel.name}..."
+                )
+
+                embed = discord.Embed(
+                    title="📅 Twitch Daily Chat Log",
+                    description=(
+                        f"**チャンネル:** {channel_display} ({channel_login})\n"
+                        f"**日付:** {day_str} (UTC)\n"
+                        f"**JST範囲:** {day_jst_range_text(day)}\n"
+                        f"**メッセージ数:** {message_count:,}{u_label}"
+                    ),
+                    color=0x9146FF,
+                )
+                if profile_img:
+                    embed.set_author(
+                        name=channel_display,
+                        url=f"https://www.twitch.tv/{channel_login}",
+                        icon_url=profile_img,
+                    )
+                details = [
+                    f"圧縮: zstd (level {logs_api.get_zstd_level()}) | {total_size/1024:.1f}KB",
+                    f"ソース: {logs_api.LOG_SOURCE_NAME}",
+                ]
+                if len(parts) > 1:
+                    details.append(f"分割済み: {len(parts)}ファイル")
+                embed.add_field(name="詳細", value=" | ".join(details), inline=False)
+                embed.set_footer(text="Twitch Chat Logger")
+                embed.timestamp = datetime.now()
+
+                content_with_label = (
+                    f"📅 **[保存完了]** **{channel_display}** のデイリーチャットログ\n"
+                    f"└ {day_str} (UTC) / {message_count:,}件{u_label}"
+                )
+
+                message_ids = await self._send_log_parts(
+                    dest_channel, parts, embed, content_with_label,
+                )
+                if not message_ids:
+                    await self._update_status(
+                        interaction, status_msg,
+                        f"{prefix}❌ `{channel_login}` {day_str} UP失敗"
+                    )
+                    return False
+
+                dedup_msg_id = await self._post_log_dedup_entry(
+                    dedup_channel, channel_login, channel_display, channel_id,
+                    day, user_filter, message_count, len(parts), total_size,
+                )
+                if dedup_msg_id:
+                    message_ids.insert(0, dedup_msg_id)
+
+            # ローカルDBに記録 + スキャンキャッシュ更新
+            self.logger.db.record_log_upload(log_id, {
+                "channel_login": channel_login,
+                "channel_display_name": channel_display,
+                "user_filter": user_filter or "",
+                "log_date": day_str,
+                "message_count": message_count,
+                "total_parts": len(parts),
+                "compressed_size_bytes": total_size,
+                "discord_channel_id": str(dedup_channel.id),
+                "discord_message_ids": message_ids,
+                "is_empty": message_count == 0,
+            })
+            cid = str(dedup_channel.id)
+            self._logs_scan_cache.setdefault(cid, set()).add(log_id)
+
+            done_text = (
+                f"完了! 0件 (ログなし、重複防止DB登録済)"
+                if message_count == 0
+                else f"完了! {message_count:,}件 / {len(parts)}file / {total_size/1024:.1f}KB"
+            )
+            await self._update_status(
+                interaction, status_msg,
+                f"{prefix}✅ `{channel_login}` {day_str} {done_text}\n"
+                f"📂 保存先: {dest_channel.mention}"
+            )
+            return True
+
+        except LogsAPIError as e:
+            await self._update_status(interaction, status_msg, f"{prefix}⚠️ `{channel_login}` {day_str} {e}")
+            return False
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[!] logs-day error {channel_login} {day_str}: {tb}", file=sys.stderr)
+            await self._update_status(interaction, status_msg, f"{prefix}❌ `{channel_login}` {day_str} {e}")
+            return False
+
+    async def _send_log_parts(
+        self,
+        channel: discord.TextChannel,
+        parts: list[dict],
+        embed: discord.Embed,
+        content_with_label: str,
+        max_retries: int = 3,
+    ) -> list[str]:
+        """デイリーログの圧縮ファイルをアップロードする (リトライ/レート制限対応)。"""
+        message_ids: list[str] = []
+        first_archive_msg = None
+
+        for part_idx, part in enumerate(parts):
+            sent = False
+            for attempt in range(max_retries + 1):
+                file_obj = discord.File(io_module.BytesIO(part["data"]), filename=part["name"])
+                try:
+                    if part["part"] == 1:
+                        first_archive_msg = await channel.send(
+                            content=content_with_label, embed=embed, file=file_obj,
+                        )
+                        message_ids.append(str(first_archive_msg.id))
+                    else:
+                        label = (
+                            f"**📅 {part['name'].rsplit('.', 2)[0]} - Part {part['part']}/{part['total']}**"
+                        )
+                        msg = await channel.send(content=label, file=file_obj)
+                        message_ids.append(str(msg.id))
+                    sent = True
+                    break
+                except discord.HTTPException as e:
+                    err_str = str(e)
+                    if "rate" in err_str.lower() or "429" in err_str:
+                        wait_time = 5.0 * (attempt + 1)
+                        await channel.send(f"⏳ ﾚｰﾄ制限: {wait_time:.0f}秒待機...")
+                        await asyncio.sleep(wait_time)
+                    elif attempt < max_retries:
+                        await asyncio.sleep(3.0 * (attempt + 1))
+                    else:
+                        print(f"[!] logs part upload failed: {e}")
+                        return []
+            if sent and part_idx < len(parts) - 1:
+                await asyncio.sleep(0.5)
+
+        return message_ids
+
+    async def _post_log_dedup_entry(
+        self,
+        dedup_channel: discord.TextChannel,
+        channel_login: str,
+        channel_display: str,
+        channel_id: str,
+        day,
+        user_filter: Optional[str],
+        message_count: int,
+        total_parts: int,
+        total_size: int,
+        archive_msg=None,
+    ) -> Optional[str]:
+        """重複金庫チャンネルにJSONメタデータを投稿する (VODと同じ方式)。"""
+        try:
+            jm = json.dumps({
+                "t": "logs", "v": 1,
+                "ch": channel_login.lower(),
+                "cid": str(channel_id or ""),
+                "sd": channel_display,
+                "u": (user_filter or "").lower(),
+                "d": f"{day:%Y-%m-%d}",
+                "n": message_count,
+                "p": total_parts,
+                "z": total_size,
+                "src": "zonian",
+            }, ensure_ascii=False)
+
+            u_note = f" (user: {user_filter})" if user_filter else ""
+            dedup_content = (
+                f"🔑 **[重複回避データ]** **{channel_display}** - `{channel_login}` `{day:%Y-%m-%d}` (UTC){u_note}\n"
+                f"├ 種別: デイリーログ (logs.zonian.dev)\n"
+                f"├ メッセージ数: {message_count:,}件\n"
+                f"└ パート数: {total_parts}件\n"
+                f"{jm}"
+            )
+            dedup_msg = await dedup_channel.send(content=dedup_content)
+
+            if archive_msg is not None:
+                try:
+                    embed = archive_msg.embeds[0] if archive_msg.embeds else None
+                    if embed:
+                        e = embed.to_dict()
+                        e.setdefault("fields", []).append({
+                            "name": "データ連携",
+                            "value": f"🔗 [生JSONメタデータを確認する]({dedup_msg.jump_url})",
+                            "inline": False,
+                        })
+                        from_discord_embed = discord.Embed.from_dict(e)
+                        await archive_msg.edit(embed=from_discord_embed)
+                except Exception as edit_err:
+                    print(f"[!] Failed to link dedup entry: {edit_err}")
+
+            return str(dedup_msg.id)
+        except Exception as e:
+            print(f"[!] Failed to post logs metadata to dedup channel: {e}")
+            return None
+
     # ---- Track List Management Internal Methods ----
 
     async def _get_track_message(self, channel: discord.TextChannel) -> discord.Message:
@@ -1017,6 +1425,15 @@ bot_instance: Optional[TwitchChatBot] = None
 # Slash command group: `/chat`
 chat_group = app_commands.Group(name="chat", description="Twitch Chat Logger Commands")
 track_group = app_commands.Group(name="track", description="トラッキングリストの管理コマンド", parent=chat_group)
+logs_group = app_commands.Group(name="logs", description="デイリーチャットログ (logs.zonian.dev) のDL・確認", parent=chat_group)
+
+
+def _parse_utc_date_param(value: str, field_label: str):
+    """'YYYY-MM-DD' 形式の日付パラメータを検証して date に変換する。"""
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"{field_label} は `YYYY-MM-DD` 形式で指定してください (例: 2026-08-27)")
 
 
 # --- /chat download ---
@@ -1113,6 +1530,227 @@ async def slash_download(interaction: discord.Interaction, streamer: str, vod_id
         tb = traceback.format_exc()
         print(f"[!] download error: {tb}", file=sys.stderr)
         await interaction.followup.send(f"❌ エラー: {e}")
+
+
+# --- /chat logs download ---
+@logs_group.command(name="download", description="デイリーチャットログ(zonian)を1日ずつDL→圧縮→保管 (確定済みの日のみ)")
+@app_commands.describe(
+    channel="配信者のユーザー名 (Login ID)",
+    user="特定ユーザーの発言のみ抽出 (省略可)",
+    date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
+    date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
+    limit="最大DL日数 (省略時: 全件)",
+    force="重複チェックを無視して再DL (省略時: 無効)",
+)
+async def slash_logs_download(
+    interaction: discord.Interaction,
+    channel: str,
+    user: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: Optional[int] = None,
+    force: bool = False,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
+
+    await interaction.response.defer()
+    bot = bot_instance
+
+    dest_channel = await bot._get_or_create_logs_archive_channel(interaction.guild)
+    dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
+    if not dest_channel or not dedup_channel:
+        return await interaction.followup.send("❌ チャンネルの取得・作成に失敗しました。Botの管理権限を確認してください。")
+
+    channel_clean = channel.lower().strip().lstrip("@")
+    user_clean = (user or "").strip().lstrip("@") or None
+
+    try:
+        d_from = _parse_utc_date_param(date_from, "date_from") if date_from else None
+        d_to = _parse_utc_date_param(date_to, "date_to") if date_to else None
+    except ValueError as e:
+        return await interaction.followup.send(f"❌ {e}")
+
+    if d_from and d_to and d_from > d_to:
+        return await interaction.followup.send("❌ date_from が date_to より未来です。")
+    if limit is not None and limit < 1:
+        return await interaction.followup.send("❌ limit は1以上で指定してください。")
+
+    # 表示名の解決 (Twitch API。失敗してもzonian側でlogin解決できるので続行)
+    display = channel_clean
+    profile_img = None
+    try:
+        ui = await asyncio.to_thread(bot.logger.resolve_streamer, channel_clean)
+        if ui:
+            display = ui.get("displayName") or channel_clean
+            if ui.get("login"):
+                channel_clean = ui["login"]
+            profile_img = ui.get("profileImageURL") or None
+    except Exception:
+        pass
+
+    u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
+    status_msg = await interaction.followup.send(
+        f"🔎 `{display}` のデイリーログ情報を取得中... (ソース: logs.zonian.dev){u_label}"
+    )
+
+    try:
+        info = await asyncio.to_thread(bot.zonian.get_available_days, channel_clean, user_clean)
+    except LogsAPIError as e:
+        return await bot._update_status(interaction, status_msg, f"❌ {e}")
+    except Exception as e:
+        return await bot._update_status(interaction, status_msg, f"❌ APIエラー: {e}")
+
+    channel_login = info["channel_login"]
+    channel_id = info["channel_id"]
+    all_days = info["days"]
+
+    # 「確実に1日が終わっている」日のみ対象 (UTC基準 + 安全マージン)
+    now_utc = datetime.now(timezone.utc)
+    margin_h = get_safety_margin_hours()
+    complete_days = [d for d in all_days if day_is_complete(d, now=now_utc, margin_hours=margin_h)]
+    incomplete_days = [d for d in all_days if d not in complete_days]
+
+    in_range = complete_days
+    if d_from:
+        in_range = [d for d in in_range if d >= d_from]
+    if d_to:
+        in_range = [d for d in in_range if d <= d_to]
+
+    pending: list = []
+    skipped = 0
+    for d in in_range:
+        log_id = make_log_id(channel_login, user_clean, d.isoformat())
+        if not force and await bot._is_log_uploaded_in_channel(dedup_channel, log_id):
+            skipped += 1
+        else:
+            pending.append(d)
+
+    if not pending:
+        return await bot._update_status(
+            interaction,
+            status_msg,
+            f"⏭️ `{display}` 未DLの日なし{u_label}\n"
+            f"   記録済み: {len(all_days)}日中 保存済み{skipped}日 / "
+            f"未終了(対象外){len(incomplete_days)}日\n"
+            f"📂 保管先: {dest_channel.mention}"
+        )
+
+    if limit is not None:
+        pending = pending[:limit]
+
+    total_new = len(pending)
+    oldest, newest = pending[0], pending[-1]
+    status_msg = await bot._update_status(
+        interaction,
+        status_msg,
+        f"📋 `{display}` 未DL {total_new}日発見{u_label}\n"
+        f"   保管先: {dest_channel.mention}\n"
+        f"   期間: {oldest:%Y-%m-%d} ～ {newest:%Y-%m-%d} (UTC / 古い順にDL開始)\n"
+        f"   ⏭️ 保存済み{skipped}日 ｽｷｯﾌﾟ / 未終了{len(incomplete_days)}日 対象外"
+    )
+
+    ok_count = 0
+    for i, d in enumerate(pending):
+        day_idx = f"[{i+1}/{total_new}]"
+        if await bot._process_day_log(
+            interaction, channel_login, display, channel_id, d,
+            dest_channel=dest_channel, dedup_channel=dedup_channel,
+            user_filter=user_clean, status_msg=status_msg, day_index=day_idx,
+            profile_img=profile_img,
+        ):
+            ok_count += 1
+        if i < len(pending) - 1:
+            await asyncio.sleep(2.5)
+
+    await bot._update_status(
+        interaction,
+        status_msg,
+        f"📊 `{display}` 完了: {ok_count}日成功 / {total_new}日中{u_label}\n"
+        f"⏭️ 保存済み{skipped}日 ｽｷｯﾌﾟ / 未終了{len(incomplete_days)}日 対象外\n"
+        f"📂 チャンネル: {dest_channel.mention}"
+    )
+
+
+# --- /chat logs days ---
+@logs_group.command(name="days", description="デイリーログの記録日数・保存状況・DL可能日を表示")
+@app_commands.describe(channel="配信者のユーザー名 (Login ID)", user="特定ユーザーで絞り込む場合 (省略可)")
+async def slash_logs_days(interaction: discord.Interaction, channel: str, user: Optional[str] = None):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
+
+    await interaction.response.defer()
+    bot = bot_instance
+    dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
+    if not dedup_channel:
+        return await interaction.followup.send("❌ 重複金庫チャンネルの取得に失敗しました。")
+
+    channel_clean = channel.lower().strip().lstrip("@")
+    user_clean = (user or "").strip().lstrip("@") or None
+
+    status_msg = await interaction.followup.send(f"🔎 `{channel_clean}` のログ情報を取得中...")
+
+    try:
+        info = await asyncio.to_thread(bot.zonian.get_available_days, channel_clean, user_clean)
+    except LogsAPIError as e:
+        return await bot._update_status(interaction, status_msg, f"❌ {e}")
+    except Exception as e:
+        return await bot._update_status(interaction, status_msg, f"❌ APIエラー: {e}")
+
+    channel_login = info["channel_login"]
+    display = channel_login
+    try:
+        ui = await asyncio.to_thread(bot.logger.resolve_streamer, channel_login)
+        if ui:
+            display = ui.get("displayName") or channel_login
+    except Exception:
+        pass
+
+    # DB + 重複金庫チャンネルから保存済みlog_idを収集
+    uploaded_ids = bot.logger.db.get_uploaded_log_ids(channel_login, user_clean)
+    cid = str(dedup_channel.id)
+    if cid not in bot._logs_scan_cache:
+        await bot._scan_channel_for_uploads(dedup_channel)
+    uploaded_ids |= bot._logs_scan_cache.get(cid, set())
+
+    def is_uploaded(d) -> bool:
+        return make_log_id(channel_login, user_clean, d.isoformat()) in uploaded_ids
+
+    all_days = info["days"]
+    now_utc = datetime.now(timezone.utc)
+    margin_h = get_safety_margin_hours()
+    complete = [d for d in all_days if day_is_complete(d, now=now_utc, margin_hours=margin_h)]
+    incomplete = [d for d in all_days if d not in complete]
+    uploaded = [d for d in complete if is_uploaded(d)]
+    pending = [d for d in complete if not is_uploaded(d)]
+
+    u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
+    since = info["since"]
+    lines = [
+        f"**📅 `{display}` のデイリーログ情報**{u_label}",
+        f"ソース: {logs_api.LOG_SOURCE_NAME} (記録インスタンス: {len(info['instances'])}台)",
+        f"記録済み: **{len(all_days)}日**" + (f" ({since:%Y-%m-%d}～)" if since else ""),
+        f"保存済み: {len(uploaded)}日 / **未保存(確定済): {len(pending)}日** / 未終了(対象外): {len(incomplete)}日",
+    ]
+
+    if pending:
+        next_days = ", ".join(f"`{d:%Y-%m-%d}`" for d in pending[:10])
+        more = f" ...他{len(pending)-10}日" if len(pending) > 10 else ""
+        lines.append(f"次回DL対象 (古い順): {next_days}{more}")
+
+    if incomplete:
+        latest = incomplete[-1]
+        lines.append(
+            f"⏳ 未終了: {', '.join(f'`{d:%Y-%m-%d}`' for d in incomplete[-3:])} "
+            f"(UTC基準のため JST では {day_jst_range_text(latest)} まで)"
+        )
+
+    lines.append(
+        f"ℹ️ 1日 = UTC 00:00〜23:59 (JST+9h) / 完了判定: UTC24時 + 安全マージン{margin_h:g}時間"
+    )
+    lines.append(f"📥 DL: `/chat logs download channel:{channel_login}`")
+
+    await bot._update_status(interaction, status_msg, "\n".join(lines))
 
 
 # --- /chat track add ---
@@ -1566,15 +2204,17 @@ async def slash_status(interaction: discord.Interaction):
     h, m = int(uptime // 3600), int((uptime % 3600) // 60)
     all_u = bot.logger.db.get_uploads()
     partial = sum(1 for u in all_u if u.get("is_partial"))
+    all_logs = bot.logger.db.get_log_uploads(limit=1000000)
     text = (
         f"**🤖 Bot Status**\n"
         f"**稼働時間:** {h}h{m}m | **Ping:** {round(bot.latency*1000)}ms\n"
         f"**記録VOD数:** {len(all_u)}件 (部分{partial}) | **カテゴリ:** `{CATEGORY_NAME}`\n"
+        f"**記録デイリーログ数:** {len(all_logs)}日分 (ソース: {logs_api.LOG_SOURCE_NAME})\n"
         f"**接続サーバー数:** {len(bot.guilds)} | **保存先パス:** `{bot.logger.data_dir}`\n"
         f"**Bot上限:** {BOT_UPLOAD_LIMIT//(1024*1024)}MB\n"
         f"**絵文字機能:** {'有効' if bot.logger.enable_emotes else '無効'}\n"
         f"**履歴スキャン:** 無制限 (limit=None)\n"
-        f"**重複金庫:** `#{DEDUP_CHANNEL_NAME}`"
+        f"**重複金庫:** `#{DEDUP_CHANNEL_NAME}` | **ログ本棚:** `#{LOGS_ARCHIVE_CHANNEL_NAME}`"
     )
     await interaction.followup.send(text)
 

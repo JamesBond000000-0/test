@@ -66,6 +66,24 @@ class ChatLoggerDB:
                 is_partial INTEGER DEFAULT 0
             )
         """)
+        # デイリーチャットログ (logs.zonian.dev) 用テーブル
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_log_uploads (
+                log_id TEXT PRIMARY KEY,
+                channel_login TEXT,
+                channel_display_name TEXT,
+                user_filter TEXT,
+                log_date TEXT,
+                message_count INTEGER DEFAULT 0,
+                total_parts INTEGER DEFAULT 0,
+                compressed_size_bytes INTEGER DEFAULT 0,
+                uploaded_at TEXT NOT NULL,
+                discord_channel_id TEXT,
+                discord_message_ids TEXT,
+                is_empty INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'logs.zonian.dev'
+            )
+        """)
         self._conn.commit()
 
     def is_uploaded(self, vod_id: str) -> bool:
@@ -121,7 +139,7 @@ class ChatLoggerDB:
                 (limit,),
             ).fetchall()
 
-        cols = [d[0] for d in self._conn.execute("PRAGMA table_info(uploads)").fetchall()]
+        cols = [d[1] for d in self._conn.execute("PRAGMA table_info(uploads)").fetchall()]  # d[1]=カラム名
         result = []
         for row in rows:
             d = dict(zip(cols, row))
@@ -131,6 +149,78 @@ class ChatLoggerDB:
 
     def remove_upload(self, vod_id: str):
         self._conn.execute("DELETE FROM uploads WHERE vod_id = ?", (vod_id,))
+        self._conn.commit()
+
+    # ---- デイリーログ (logs.zonian.dev) 関連 ----
+
+    def is_log_uploaded(self, log_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM daily_log_uploads WHERE log_id = ?", (log_id,)
+        ).fetchone()
+        return row is not None
+
+    def record_log_upload(self, log_id: str, metadata: dict):
+        self._conn.execute("""
+            INSERT OR REPLACE INTO daily_log_uploads
+                (log_id, channel_login, channel_display_name, user_filter,
+                 log_date, message_count, total_parts, compressed_size_bytes,
+                 uploaded_at, discord_channel_id, discord_message_ids,
+                 is_empty, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            log_id,
+            metadata.get("channel_login"),
+            metadata.get("channel_display_name"),
+            metadata.get("user_filter") or "",
+            metadata.get("log_date"),
+            metadata.get("message_count", 0),
+            metadata.get("total_parts", 0),
+            metadata.get("compressed_size_bytes", 0),
+            datetime.now(timezone.utc).isoformat(),
+            metadata.get("discord_channel_id"),
+            json.dumps(metadata.get("discord_message_ids", [])),
+            1 if metadata.get("is_empty", False) else 0,
+            metadata.get("source", "logs.zonian.dev"),
+        ))
+        self._conn.commit()
+
+    def get_log_uploads(
+        self,
+        channel_login: str | None = None,
+        user_filter: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        q = "SELECT * FROM daily_log_uploads"
+        conds, params = [], []
+        if channel_login:
+            conds.append("channel_login = ?")
+            params.append(channel_login.lower())
+        if user_filter is not None:
+            conds.append("user_filter = ?")
+            params.append(user_filter.lower())
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY log_date ASC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(q, params).fetchall()
+
+        cols = [d[1] for d in self._conn.execute("PRAGMA table_info(daily_log_uploads)").fetchall()]  # d[1]=カラム名
+        result = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            d["discord_message_ids"] = json.loads(d.get("discord_message_ids") or "[]")
+            result.append(d)
+        return result
+
+    def get_uploaded_log_ids(self, channel_login: str, user_filter: str | None = None) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT log_id FROM daily_log_uploads WHERE channel_login = ? AND user_filter = ?",
+            (channel_login.lower(), (user_filter or "").lower()),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def remove_log_upload(self, log_id: str):
+        self._conn.execute("DELETE FROM daily_log_uploads WHERE log_id = ?", (log_id,))
         self._conn.commit()
 
     def is_partial(self, vod_id: str) -> bool:
