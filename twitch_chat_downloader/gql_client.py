@@ -20,6 +20,41 @@ VIDEO_COMMENTS_HASH = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa
 # Persisted query hash for ClipComments (for clip chat download)
 CLIP_COMMENTS_HASH = "fbf5ee0b7d150c33c77cb5c5e072ee1cc3c18f9b6e6861c56e4a35918ed96482"
 
+# These HTTP statuses mean the request itself was rejected (bad/unknown VOD,
+# stale persisted-query hash, ...). Re-sending the identical body cannot fix
+# them, so they must not go through the retry loop.
+PERMANENT_HTTP_STATUS = frozenset({400, 404, 422})
+# ...but still give a request one cheap second chance before declaring it dead.
+PERMANENT_HTTP_RETRIES = 1
+
+
+class VODUnavailableError(Exception):
+    """
+    VOD が取得できない (削除済み / 保管期限切れ / 非公開 /  BAN 済みチャンネル)。
+
+    一時的な通信エラーと区別するための例外で、再試行しても復旧しないため
+    リトライ対象から除外する。
+    """
+
+    retryable = False
+
+
+def gql_error_message(payload: Any) -> Optional[str]:
+    """Pull the first GraphQL error message out of a response body, if any."""
+    if not isinstance(payload, dict):
+        return None
+    errors = payload.get("errors")
+    if not errors:
+        return None
+    if not isinstance(errors, list):
+        return str(errors)
+    first = errors[0] if errors else None
+    if first is None:
+        return None
+    if isinstance(first, dict):
+        return str(first.get("message") or first)
+    return str(first)
+
 
 @dataclass
 class Commenter:
@@ -144,9 +179,31 @@ class TwitchGQLClient:
         for attempt in range(max_retries + 1):
             try:
                 resp = self.client.post(url, json=payload)
+
+                # Twitch answers a deleted / expired / private VOD with HTTP 400 and
+                # a misleading "persistedQuery does not have a valid sha256 hash" body.
+                # Same for a genuinely stale persisted-query hash: a full retry loop
+                # cannot fix it, so give it one cheap second chance (to absorb a
+                # transient edge/anti-bot hiccup) and then bail out - instead of
+                # burning ~1 minute (1+2+...+10 s of backoff) per dead VOD.
+                if resp.status_code in PERMANENT_HTTP_STATUS:
+                    if attempt < PERMANENT_HTTP_RETRIES:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    try:
+                        detail = gql_error_message(resp.json())
+                    except (json.JSONDecodeError, ValueError):
+                        detail = None
+                    raise VODUnavailableError(
+                        f"VOD {video_id}: HTTP {resp.status_code} - "
+                        f"{detail or resp.text[:200]}"
+                    )
+
                 resp.raise_for_status()
                 data = resp.json()
                 return data
+            except VODUnavailableError:
+                raise
             except (httpx.HTTPError, json.JSONDecodeError) as e:
                 if attempt == max_retries:
                     raise RuntimeError(
@@ -168,6 +225,12 @@ class TwitchGQLClient:
         Download all comments from a Twitch VOD.
         Returns (comments, video_created_at, channel_id, video_title, is_partial).
         is_partial=True means the download may be incomplete (connection issues, etc.).
+
+        Raises:
+            VODUnavailableError: the VOD itself is not fetchable (deleted, expired,
+                private, suspended channel, or a stale persisted-query hash). Not
+                retryable.
+            RuntimeError: transport-level failures that exhausted their retries.
         """
         comments: list[Comment] = []
         cursor: Optional[str] = None
@@ -179,7 +242,6 @@ class TwitchGQLClient:
         video_title: Optional[str] = None
         video_start = trim_beginning or 0
         video_end = trim_ending or float("inf")
-        total_expected_pages = 0
         pages_fetched = 0
         is_partial = False
 
@@ -198,26 +260,41 @@ class TwitchGQLClient:
                 is_partial = True
                 break
 
+            # ---- Validate response -------------------------------------------
+            # Twitch returns HTTP 200 with {"data": {"video": null}} when the VOD
+            # is gone (expired / deleted / private / suspended channel). The key
+            # *exists*, so `data.get("video", {})` hands back None rather than the
+            # {} default. That None then raised
+            # AttributeError: 'NoneType' object has no attribute 'get' when the
+            # video-level metadata was read below, before any null check ran.
+            payload_data = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(payload_data, dict):
+                detail = gql_error_message(data)
+                if comments:
+                    print(f"[!] Chat download interrupted after {len(comments)} comments: {detail}")
+                    is_partial = True
+                    break
+                raise RuntimeError(
+                    f"GQL error while fetching VOD {video_id}: "
+                    f"{detail or 'empty or malformed response'}"
+                )
+
+            video_data = payload_data.get("video")
+            if not isinstance(video_data, dict):
+                if comments:
+                    is_partial = True
+                    break
+                raise VODUnavailableError(
+                    f"VOD {video_id}: 取得できません "
+                    "(削除済み・保管期限切れ・非公開・チャンネル閉鎖の可能性)"
+                )
+
             # Extract video-level info on first request
             if is_first:
-                try:
-                    video_data = data.get("data", {}).get("video", {})
-                    video_created_at = video_data.get("createdAt")
-                    creator = video_data.get("creator", {})
-                    channel_id = creator.get("id") if creator else None
-                    # Estimate total pages from first response
-                    if video_data.get("comments", {}).get("edges"):
-                        total_expected_pages = 1  # will be updated as we go
-                except (KeyError, IndexError):
-                    pass
-
-            # Validate response - video can be null if it doesn't exist
-            video_data = data.get("data", {}).get("video")
-            if video_data is None:
-                if not comments:
-                    raise ValueError(f"VOD {video_id} not found or has no comments")
-                is_partial = True
-                break
+                video_created_at = video_data.get("createdAt")
+                video_title = video_data.get("title")
+                creator = video_data.get("creator")
+                channel_id = creator.get("id") if isinstance(creator, dict) else None
 
             video_comments = video_data.get("comments")
             if video_comments is None:

@@ -186,7 +186,9 @@ def _verify_user(login: str) -> Optional[dict]:
             json={"query": f"query{{user(login:\"{login}\"){{id login displayName}}}}"},
             timeout=10.0)
         if resp.status_code == 200:
-            user = resp.json().get("data", {}).get("user")
+            body = resp.json() if resp.text else {}
+            data = body.get("data") if isinstance(body, dict) else None
+            user = data.get("user") if isinstance(data, dict) else None
             if user and user.get("id"):
                 _log(f"Verified via API: {user['login']} (ID: {user['id']})")
                 return {"login": user["login"], "id": user["id"], "display_name": user.get("displayName", user["login"])}

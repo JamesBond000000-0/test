@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Callable
 
-from .gql_client import TwitchGQLClient, Comment
+from .gql_client import TwitchGQLClient, Comment, VODUnavailableError
 from .twitch_api import TwitchAPI
 from .emote_service import EmoteService
-from .formatters import format_json, format_html
+from .formatters import format_json, format_html, get_vod_zstd_level
 
 
 # Botアップロード上限（Botデフォルト8MB。分割対象は7.2MB）
@@ -307,6 +307,11 @@ class ChatLogger:
                 return self._download_and_prepare_impl(
                     vod_id, streamer_login, trim_beginning, trim_ending, progress_callback,
                 )
+            except VODUnavailableError as e:
+                # 削除済み/期限切れ/非公開の VOD は何度リトライしても同じ。
+                # 数十秒×max_retries を無駄に費やさず、呼び出し側にスキップ判断を委ねる。
+                print(f"[x] VOD {vod_id} スキップ: {e}")
+                raise
             except (RuntimeError, ValueError, ConnectionError) as e:
                 last_error = e
                 print(f"[!] Attempt {attempt + 1} failed: {e}")
@@ -484,8 +489,8 @@ class ChatLogger:
         parts = []
         total = len(all_comments)
         
-        # Zstd最高圧縮レベル22を各分割ファイルに適用
-        cctx = zstd.ZstdCompressor(level=22, write_checksum=True)
+        # Zstd圧縮 (既定レベル22 / VOD_ZSTD_LEVEL で変更可・スレッド並列)
+        cctx = zstd.ZstdCompressor(level=get_vod_zstd_level(), write_checksum=True, threads=-1)
 
         for i in range(0, total, comments_per_part):
             chunk = all_comments[i:i + comments_per_part]

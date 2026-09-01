@@ -11,6 +11,23 @@ TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 TWITCH_CLIENT_ID = "kd1unb4b3q4t58fwlpcbzcbnm76a8fp"
 
 
+def _dig(payload: object, *keys: str):
+    """
+    Walk nested GQL response dicts tolerating explicit nulls.
+
+    `dict.get("user", {})` returns None (not {}) when the key exists with a null
+    value, which is exactly what Twitch sends for deleted/renamed channels and
+    expired VODs ({"data": {"user": null}}), so the naive chain raises
+    AttributeError. This helper treats any non-dict hop as "missing".
+    """
+    node = payload
+    for key in keys:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
 class TwitchAPI:
     """Minimal Twitch API client for user and VOD info."""
 
@@ -37,7 +54,7 @@ class TwitchAPI:
         data = resp.json()
         if "errors" in data:
             return None
-        user = data.get("data", {}).get("user")
+        user = _dig(data, "data", "user")
         if user:
             # Clean up profileImageURL
             url = user.get("profileImageURL", "")
@@ -64,7 +81,7 @@ class TwitchAPI:
         data = resp.json()
         if "errors" in data:
             return None
-        user = data.get("data", {}).get("user")
+        user = _dig(data, "data", "user")
         if user:
             url = user.get("profileImageURL", "")
             if url and ("{width}" in url or "{height}" in url):
@@ -116,10 +133,12 @@ class TwitchAPI:
 
             break
 
-        edges = data.get("data", {}).get("user", {}).get("videos", {}).get("edges", [])
+        edges = _dig(data, "data", "user", "videos", "edges") or []
         vods = []
         for edge in edges:
-            node = edge["node"]
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict) or "id" not in node:
+                continue
             vods.append({
                 "id": node["id"],
                 "title": node.get("title", ""),
@@ -189,12 +208,14 @@ class TwitchAPI:
                         continue
                     raise
 
-            edges = data.get("data", {}).get("user", {}).get("videos", {}).get("edges", [])
+            edges = _dig(data, "data", "user", "videos", "edges") or []
             if not edges:
                 break
 
             for edge in edges:
-                node = edge["node"]
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict) or "id" not in node:
+                    continue
                 all_vods.append({
                     "id": node["id"],
                     "title": node.get("title", ""),
@@ -203,7 +224,7 @@ class TwitchAPI:
                     "view_count": node.get("viewCount", 0),
                 })
 
-            has_next = data.get("data", {}).get("user", {}).get("videos", {}).get("pageInfo", {}).get("hasNextPage", False)
+            has_next = bool(_dig(data, "data", "user", "videos", "pageInfo", "hasNextPage"))
             if not has_next:
                 break
 
@@ -244,7 +265,7 @@ class TwitchAPI:
         data = resp.json()
         if "errors" in data:
             return None
-        video = data.get("data", {}).get("video")
+        video = _dig(data, "data", "video")
         if video is None:
             return None
 

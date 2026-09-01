@@ -12,21 +12,25 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io as io_module
 import json
+import os
 import re
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from .chat_logger import ChatLogger, BOT_UPLOAD_LIMIT
+from .gql_client import VODUnavailableError
 from . import logs_api
 from .logs_api import (
     LogsAPIError,
@@ -79,6 +83,205 @@ DESCRIPTION = (
 
 
 # ---- Helpers ----
+
+# --------------------------------------------------------------------------- #
+# 長時間バッチ (track scan / repair) の停滞監視と Discord へのログ出力
+# --------------------------------------------------------------------------- #
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# 進捗の報告が止まってから N 秒経ったら Discord に警告 / さらに M 秒で中断
+STALL_WARN_SECONDS = _env_float("BATCH_STALL_WARN_SECONDS", 120.0)
+STALL_ABORT_SECONDS = _env_float("BATCH_STALL_ABORT_SECONDS", 900.0)
+STALL_CHECK_INTERVAL = _env_float("BATCH_STALL_CHECK_SECONDS", 5.0)
+# True にするとエラーが無くても毎回ログファイルを添付する
+BATCH_LOG_ALWAYS = _env_bool("BATCH_LOG_ALWAYS", False)
+# 人ごと / VODごとの間隔 (レート制限対策。速くしたいときは 0.5 程度でも可)
+BATCH_ITEM_GAP_SECONDS = _env_float("BATCH_ITEM_GAP_SECONDS", 3.0)
+BATCH_LOG_MAX_LINES = int(_env_float("BATCH_LOG_MAX_LINES", 800))
+# DL中のステータス編集間隔 (秒)。長いVODだと編集連発でレート制限に当たるため間引く
+DL_PROGRESS_THROTTLE_SECONDS = _env_float("DL_PROGRESS_THROTTLE_SECONDS", 3.0)
+
+
+def _stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%m-%d %H:%M:%SZ")
+
+
+class BatchProgress:
+    """
+    バッチ処理の進捗と実行ログをまとめる小さな共有オブジェクト。
+
+    - 各ステップから tick() を呼ぶ -> idle_seconds() がリセットされる
+    - 監視タスク (_watch_batch_stall) が idle を見て警告 / 中断を要求する
+    - lines に全ログを ring buffer で保持し、最後に .log として Discord へ送る
+
+    ワーカーテーマ (asyncio.to_thread) からも tick() できる (contextvars は
+    to_thread にコピーされるため、_ACTIVE_PROGRESS も中で見える)。
+    """
+
+    def __init__(self, title: str, max_lines: int = BATCH_LOG_MAX_LINES):
+        self.title = title
+        self.slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_").lower() or "batch"
+        self.started = time.time()
+        self.step = "(開始)"
+        self.step_started = self.started
+        self.updated = self.started
+        self.seq = 0
+        self.warned_seq = -1
+        self.abort_requested = False
+        self.finished = False
+        self.lines: deque[str] = deque(maxlen=max_lines)
+        self.errors: list[str] = []
+        self._last_line_ts = 0.0
+
+    # ---- 進捗報告 ----
+
+    def tick(self, step: str) -> None:
+        now = time.time()
+        self.seq += 1
+        self.step = step
+        self.step_started = now
+        self.updated = now
+        self._append(step)
+
+    def throttle_tick(self, step: str, min_interval: float = 5.0) -> None:
+        """高頻度で叩く進捗用 (Discord/ログを埋め尽くさないよう間引く)。"""
+        now = time.time()
+        self.updated = now  # idle は必ずリセットする
+        if now - self._last_line_ts < min_interval:
+            return
+        self._last_line_ts = now
+        self.seq += 1
+        self.step = step
+        self.step_started = now
+        self._append(step)
+
+    def note(self, text: str) -> None:
+        self._append(text)
+
+    def error(self, header: str, exc: Optional[BaseException] = None, tb: Optional[str] = None) -> None:
+        if tb is None:
+            tb = traceback.format_exc() if exc is None else "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+        tb = (tb or "").strip()
+        if tb in ("NoneType: None", ""):
+            tb = f"{type(exc).__name__}: {exc}" if exc is not None else ""
+        self.errors.append(f"{header}\n{tb}")
+        self._append(f"X {header}")
+        for line in tb.splitlines()[-40:]:
+            self.lines.append(f"    {line}")
+
+    def _append(self, text: str) -> None:
+        line = f"[{_stamp()}] #{self.seq} {text}"
+        self.lines.append(line)
+        print(f"[{self.title}] {line}", file=sys.stderr)
+
+    # ---- 監視・ログ生成 ----
+
+    def idle_seconds(self) -> float:
+        return time.time() - self.updated
+
+    def step_seconds(self) -> float:
+        return time.time() - self.step_started
+
+    def elapsed_text(self) -> str:
+        return _format_duration(int(time.time() - self.started))
+
+    def render(self, aborted: bool = False) -> str:
+        head = [
+            f"=== {self.title} ===",
+            f"generated: {_stamp()}",
+            f"elapsed: {self.elapsed_text()}",
+            f"steps: {self.seq}",
+            f"errors: {len(self.errors)}",
+            f"current step: {self.step} (running {int(self.step_seconds())}s, idle {int(self.idle_seconds())}s)",
+            f"aborted: {aborted}",
+            "",
+            "--- log ---",
+        ]
+        body = list(self.lines)
+        parts = ["\n".join(head + body)]
+        if self.errors:
+            parts.append("\n\n--- tracebacks (%d) ---\n" % len(self.errors) + "\n\n".join(self.errors))
+        text = "".join(parts)
+        return text[:1_800_000]
+
+    def message_summary(self, aborted: bool = False, limit: int = 1900) -> str:
+        """Discord 本文に載せる要約 (2000文字制限に収める)。"""
+        lines = [
+            f"**{self.title}** {'⛔ 中断' if aborted else '❌ エラー'}",
+            f"経過 {self.elapsed_text()} / ステップ {self.seq} / エラー {len(self.errors)}",
+            f"実行中: `{self.step[:120]}` ({int(self.step_seconds())}s)",
+        ]
+        tail = list(self.lines)[-12:]
+        block = "\n".join(tail) if tail else "(ログ無し)"
+        text = "\n".join(lines) + "\n```\n" + block + "\n```"
+        if len(text) > limit:
+            text = text[:limit - 4] + "\n```"
+        return text
+
+
+# 実行中のバッチ (scan / repair) とその中の _process_vod を結ぶ
+_ACTIVE_PROGRESS: contextvars.ContextVar[Optional[BatchProgress]] = contextvars.ContextVar(
+    "active_batch_progress", default=None
+)
+
+
+async def _notify(interaction: Optional[discord.Interaction], text: str) -> None:
+    """
+    バッチ処理の速報をチャンネルへ送る (送信失敗で本処理を止めない)。
+
+    インタラクションのトークンは 15 分で失効するので、通常のチャンネル送信を
+    優先する。track scan のように長時間走る処理ではこれが効く。
+    """
+    channel = getattr(interaction, "channel", None) if interaction else None
+    body = text[:2000]
+    try:
+        if channel is not None:
+            await channel.send(body)
+        elif interaction is not None:
+            await interaction.followup.send(body)
+    except Exception as e:
+        print(f"[!] 通知送信に失敗 ({type(e).__name__}: {e}): {body[:120]}", file=sys.stderr)
+
+
+def _batch_tick(step: str) -> None:
+    """進行中バッチがあれば進捗を報告する (無ければ何もしない)。"""
+    prog = _ACTIVE_PROGRESS.get()
+    if prog is not None:
+        prog.tick(step)
+
+
+def _batch_throttle_tick(step: str) -> None:
+    prog = _ACTIVE_PROGRESS.get()
+    if prog is not None:
+        prog.throttle_tick(step)
+
+
+def _batch_note(text: str) -> None:
+    prog = _ACTIVE_PROGRESS.get()
+    if prog is not None:
+        prog.note(text)
+
+
+def _batch_error(header: str, exc: Optional[BaseException] = None, tb: Optional[str] = None) -> None:
+    prog = _ACTIVE_PROGRESS.get()
+    if prog is not None:
+        prog.error(header, exc, tb)
+
 
 def _format_duration(seconds: int) -> str:
     seconds = int(seconds)
@@ -479,6 +682,160 @@ class TwitchChatBot(commands.Bot):
         uploads = self.logger.db.get_uploads()
         return sum(1 for u in uploads if u.get("discord_channel_id") == cid)
 
+    # ---- Batch stall monitor + Discord log shipping ----
+
+    async def _watch_batch_stall(
+        self,
+        interaction: Optional[discord.Interaction],
+        progress: BatchProgress,
+        task: "asyncio.Task[dict]",
+        status_msg: Optional[discord.Message] = None,
+        *,
+        warn_after: Optional[float] = None,
+        abort_after: Optional[float] = None,
+    ) -> None:
+        warn_after = STALL_WARN_SECONDS if warn_after is None else warn_after
+        abort_after = STALL_ABORT_SECONDS if abort_after is None else abort_after
+        """
+        進捗報告 (progress.tick) が止まっているかを監視するバックグラウンドタスク。
+
+        - warn_after 秒 応答なし -> ステータスメッセージに警告だけ出す (処理は続行)
+        - abort_after 秒 応答なし -> progress.abort_requested を立てて本体を中断させる
+
+        本体は asyncio.to_thread 経由なので、この監視は本体が重たい圧縮で CPU を
+        占有していても必ず回るのは重要 (従来は本体がループを占有してしまい、
+        凍結したように見えていた)。
+        """
+        while not progress.finished:
+            await asyncio.sleep(STALL_CHECK_INTERVAL)
+            if progress.finished:
+                return
+            idle = progress.idle_seconds()
+
+            if abort_after > 0 and idle >= abort_after:
+                progress.abort_requested = True
+                progress.note(
+                    f"⛔ {int(idle)}s 進捗なし (実行中: {progress.step}) -> バッチ中断を要求"
+                )
+                await self._update_status(
+                    interaction, status_msg,
+                    f"⛔ {int(idle)}秒 応答なし (実行中: `{progress.step[:100]}`)\n"
+                    f"   中断します... ログを Discord に出力します"
+                )
+                task.cancel()
+                return
+
+            if warn_after > 0 and idle >= warn_after and progress.warned_seq != progress.seq:
+                progress.warned_seq = progress.seq
+                await self._update_status(
+                    interaction, status_msg,
+                    f"⚠️ {int(idle)}秒 進捗なし... 実行中: `{progress.step[:100]}`\n"
+                    f"   経過 {progress.elapsed_text()} (続行中 / {int(abort_after)}s で中断)"
+                )
+
+    async def _send_batch_log(
+        self,
+        interaction: Optional[discord.Interaction],
+        progress: BatchProgress,
+        *,
+        channel: Optional[discord.abc.Messageable] = None,
+        aborted: bool = False,
+    ) -> Optional[discord.Message]:
+        """
+        実行ログ (.log) を Discord に投稿する。
+
+        インタラクションのトークンは 15 分で失効するので、可能なら通常の
+        チャンネル送信 (interaction.channel) を使う。失敗してもログを stdout に
+        全量出力して失わないようにする。
+        """
+        text = progress.render(aborted=aborted)
+        filename = f"{progress.slug}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.log"
+        body = progress.message_summary(aborted=aborted)
+        sent: Optional[discord.Message] = None
+
+        target = channel or (getattr(interaction, "channel", None) if interaction else None)
+        try:
+            file = discord.File(io_module.BytesIO(text.encode("utf-8")), filename=filename)
+            if target is not None:
+                sent = await target.send(content=body, file=file)
+            elif interaction is not None:
+                sent = await interaction.followup.send(content=body, file=file)
+            else:
+                raise RuntimeError("送信先のチャンネルがありません")
+        except Exception as e:  # 容量超過・権限・失効トークン etc.
+            print(f"[!] {progress.title}: ログ添付に失敗 ({e}) -> 本文のみ送信します", file=sys.stderr)
+            try:
+                if target is not None:
+                    sent = await target.send(content=f"{body}\n```\n{filename}: 添付失敗 ({e})\n```")
+                elif interaction is not None:
+                    sent = await interaction.followup.send(content=body)
+            except Exception as e2:
+                print(f"[!] {progress.title}: ログ送信自体に失敗 ({e2})", file=sys.stderr)
+
+        # Colab コンソールにも全文 (スクロールで消えても見られるように)
+        print(f"===== {progress.title} log =====\n{text}", file=sys.stderr)
+        return sent
+
+    async def _run_batch(
+        self,
+        interaction: Optional[discord.Interaction],
+        *,
+        title: str,
+        body: Callable[[BatchProgress], Awaitable[dict]],
+        status_msg: Optional[discord.Message] = None,
+        channel: Optional[discord.abc.Messageable] = None,
+    ) -> dict:
+        """
+        バッチ本体 (body) を停滞監視付きで実行する。
+
+        body は (progress) を受け取り dict を返す。step ごとに progress.tick() を
+        呼ぶこと。バッチ全体が死ぬか中断された場合は、 accumulated ログを
+        Discord に .log で投稿する。個々のエラーは body 内で progress.error() に
+        溜めれば最後にまとめて添付される。
+        """
+        progress = BatchProgress(title)
+        token = _ACTIVE_PROGRESS.set(progress)
+        task = asyncio.create_task(self._guard_batch_body(body, progress))
+        watcher = asyncio.create_task(
+            self._watch_batch_stall(interaction, progress, task, status_msg)
+        )
+        aborted = False
+        result: dict = {}
+        try:
+            result = await task or {}
+        except asyncio.CancelledError:
+            if not progress.abort_requested:
+                raise  # シャットダウン等の外部キャンセルは素直に伝播させる
+            aborted = True
+            result = {"ok": False, "aborted": True}
+            progress.error(f"⛔ {int(progress.idle_seconds())}s 進捗が止まったため中断")
+        finally:
+            progress.finished = True
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            _ACTIVE_PROGRESS.reset(token)
+
+        if aborted or progress.errors or BATCH_LOG_ALWAYS:
+            await self._send_batch_log(
+                interaction, progress, channel=channel, aborted=aborted,
+            )
+
+        result.setdefault("progress", progress)
+        result["aborted"] = aborted or result.get("aborted", False)
+        return result
+
+    async def _guard_batch_body(
+        self, body: Callable[[BatchProgress], Awaitable[dict]], progress: BatchProgress,
+    ) -> dict:
+        """バッチ本体の想定外例外を捕まえてログに残す (Discord に見える形で)。"""
+        try:
+            return await body(progress) or {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            progress.error(f"❌ バッチ処理が中断されました: {type(e).__name__}: {e}", e)
+            return {"ok": False, "fatal": True, "error": str(e)}
+
     # ---- Status Message Safe Updater (Handles 15-min Token Expiration) ----
 
     async def _update_status(
@@ -503,24 +860,25 @@ class TwitchChatBot(commands.Bot):
                 pass
 
         # メッセージが無い、あるいは編集失敗時はインタラクション/チャンネル経由で送信
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(text_safe)
-                return await interaction.original_response()
-            else:
-                try:
-                    return await interaction.edit_original_response(content=text_safe)
-                except (discord.HTTPException, discord.NotFound):
-                    pass
-        except Exception:
-            pass
-
-        # 最終フォールバック: チャンネルへの直接新規投稿
-        if interaction.channel:
+        if interaction is not None:
             try:
-                return await interaction.channel.send(text_safe)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(text_safe)
+                    return await interaction.original_response()
+                else:
+                    try:
+                        return await interaction.edit_original_response(content=text_safe)
+                    except (discord.HTTPException, discord.NotFound):
+                        pass
             except Exception:
                 pass
+
+            # 最終フォールバック: チャンネルへの直接新規投稿
+            if interaction.channel:
+                try:
+                    return await interaction.channel.send(text_safe)
+                except Exception:
+                    pass
 
         return None
 
@@ -536,16 +894,21 @@ class TwitchChatBot(commands.Bot):
     ) -> bool:
         logger = self.logger
         start_time = time.time()
+        loop = asyncio.get_running_loop()
 
         try:
             prefix = f"{vod_index} " if vod_index else ""
             status_msg = await self._update_status(interaction, status_msg, f"{prefix}⬇️ `{vod_id}` ﾁｬｯﾄDL開始...")
+            _batch_tick(f"{vod_id} ﾁｬｯﾄDL開始")
 
             last_update = [time.time()]
 
             def progress_updater(latest_offset, end_offset):
+                # download_and_prepare はワーカースレッドで走るため、ここでは
+                # asyncio.create_task() が使えない (実行中ループが無く RuntimeError になる)。
+                # ループ側へ積み替える。
                 now = time.time()
-                if now - last_update[0] < 3.0:
+                if now - last_update[0] < DL_PROGRESS_THROTTLE_SECONDS:
                     return
                 last_update[0] = now
                 elapsed = now - start_time
@@ -562,15 +925,27 @@ class TwitchChatBot(commands.Bot):
                         f"{prefix}⬇️ `{vod_id}` DL中... "
                         f"({_format_duration(int(elapsed))}経過)"
                     )
+                _batch_throttle_tick(f"{vod_id} DL中 offset={int(latest_offset)}s")
                 try:
-                    asyncio.create_task(self._update_status(interaction, status_msg, text))
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_status(interaction, status_msg, text), loop
+                    )
                 except Exception:
                     pass
 
-            metadata, is_partial = logger.download_and_prepare(
+            # 重要: DL(httpx) + zstd level 22 圧縮 + 分割は数分かかる同期処理。
+            # Bot のイベントループで直接実行するとハートビートごと止まり、
+            # 「途中でスタックした」ように見える (Discord 側は応答無しで失敗扱い)。
+            #なので必ず別スレッドで走らせる。
+            metadata, is_partial = await asyncio.to_thread(
+                logger.download_and_prepare,
                 vod_id, streamer_login=streamer_login,
                 trim_beginning=trim_begin, trim_ending=trim_end,
                 progress_callback=progress_updater,
+            )
+            _batch_tick(
+                f"{vod_id} DL完了 {metadata.get('total_comments', 0):,}件 "
+                f"partial={is_partial} ({time.time() - start_time:.0f}s)"
             )
 
             metadata["streamer_display_name"] = (
@@ -599,10 +974,12 @@ class TwitchChatBot(commands.Bot):
                 status_text += f"({total_comments:,}ｺﾒﾝﾄ / {_format_duration(int(elapsed_dl))}){part_info}"
             
             status_msg = await self._update_status(interaction, status_msg, f"{status_text}\n📤 UP開始 -> #{dest_channel.name}...")
+            _batch_tick(f"{vod_id} UP開始 ({len(parts)}part / {total_size_mb:.1f}MB)")
 
             message_ids = await self._send_file_parts_adaptive(
                 interaction, metadata, channel=dest_channel, dedup_channel=dedup_channel, is_partial=is_partial,
                 progress_prefix=prefix, status_msg=status_msg)
+            _batch_tick(f"{vod_id} UP完了 ({len(message_ids or [])}msg)")
 
             if message_ids:
                 db_meta = {
@@ -644,16 +1021,33 @@ class TwitchChatBot(commands.Bot):
                 )
                 return not is_partial
             else:
+                _batch_note(f"❌ {vod_id} UP失敗 (添付を1件も送れませんでした)")
                 await self._update_status(interaction, status_msg, f"{prefix}❌ `{vod_id}` UP失敗")
                 return False
 
+        except VODUnavailableError as e:
+            # 削除済み / 期限切れ / 非公開の VOD: 失敗ではなく「スキップ」として明示
+            print(f"[-] Skip {vod_id}: {e}", file=sys.stderr)
+            _batch_note(f"⚠️ {vod_id} 取得不可 -> スキップ: {e}")
+            await self._update_status(
+                interaction, status_msg,
+                f"{prefix}⚠️ `{vod_id}` 取得不可 (削除/期限切れ/非公開) -> スキップ"
+            )
+            return False
         except ValueError as e:
+            _batch_note(f"⚠️ {vod_id} {e}")
             await self._update_status(interaction, status_msg, f"⚠️ `{vod_id}` {e}")
             return False
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[!] Error {vod_id}: {tb}", file=sys.stderr)
-            await self._update_status(interaction, status_msg, f"❌ `{vod_id}` {e}")
+            # 実行中バッチがあればログに traceback を残す (_run_batch が最後に .log で投稿)
+            _batch_error(f"❌ {vod_id} 処理中にエラー ({type(e).__name__})", e, tb)
+            await self._update_status(
+                interaction, status_msg,
+                f"❌ `{vod_id}` {type(e).__name__}: {str(e)[:400]}\n"
+                f"```\n{tb[-900:]}\n```\n(詳細は添付ログへ)"
+            )
             return False
 
     async def _send_file_parts_adaptive(
@@ -742,6 +1136,9 @@ class TwitchChatBot(commands.Bot):
 
             sent_count = len(message_ids)
             total_to_send = original_parts_count + split_attempts
+            _batch_tick(
+                f"UP {sent_count}/{total_to_send}part ({part['size']/1024/1024:.1f}MB)"
+            )
             status_msg = await self._update_status(interaction, status_msg,
                 f"{progress_prefix}📤 UP中... {sent_count}/{total_to_send}file"
                 f" ({part['size']/1024/1024:.1f}MB)")
@@ -845,6 +1242,7 @@ class TwitchChatBot(commands.Bot):
                             break
                     elif "rate" in err_str.lower() or "429" in err_str:
                         wait_time = 5.0 * (attempt + 1)
+                        _batch_tick(f"⏳ ﾚｰﾄ制限 {wait_time:.0f}s 待機 (UP)")
                         await channel.send(f"⏳ ﾚｰﾄ制限: {wait_time:.0f}秒待機...")
                         await asyncio.sleep(wait_time)
                     else:
@@ -1131,6 +1529,7 @@ class TwitchChatBot(commands.Bot):
                     err_str = str(e)
                     if "rate" in err_str.lower() or "429" in err_str:
                         wait_time = 5.0 * (attempt + 1)
+                        _batch_tick(f"⏳ ﾚｰﾄ制限 {wait_time:.0f}s 待機 (UP)")
                         await channel.send(f"⏳ ﾚｰﾄ制限: {wait_time:.0f}秒待機...")
                         await asyncio.sleep(wait_time)
                     elif attempt < max_retries:
@@ -1829,97 +2228,189 @@ async def slash_track_show(interaction: discord.Interaction):
 
 
 # --- /chat track scan ---
-@track_group.command(name="scan", description="トラッキングリストに登録されている全員の全未保存VODを一括自動取得")
-async def slash_track_scan(interaction: discord.Interaction):
-    if not interaction.guild: return
-    await interaction.response.defer()
-    bot = bot_instance
-    tracker_channel = await bot._get_or_create_tracker_channel(interaction.guild)
-    lst = await bot._load_track_list(tracker_channel)
-    if not lst:
-        return await interaction.followup.send("📭 リストが空です。先に `/chat track add` で登録してください。")
+async def _track_scan_body(
+    bot: "TwitchChatBot",
+    interaction: discord.Interaction,
+    sm: Optional[discord.Message],
+    entries: list[dict],
+    dest_channel: discord.TextChannel,
+    dedup_channel: discord.TextChannel,
+    tracker_channel: discord.TextChannel,
+    progress: BatchProgress,
+) -> dict:
+    """
+    /chat track scan の本体。progress を tick しながら順番に処理する。
 
-    sm = await interaction.followup.send(f"🔄 ﾄﾗｯｷﾝｸﾞｽｷｬﾝ開始 ({len(lst)}人) 新規VODを探します...")
-
-    dest_channel = await bot._get_or_create_archive_channel(interaction.guild)
-    dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
-    if not dest_channel or not dedup_channel:
-        return await interaction.followup.send("❌ 必要なチャンネルを取得できませんでした。")
-
+    - 同期ブロッキング呼び出し (httpx 経由の Twitch GQL) は必ず to_thread で
+      逃がす -> イベントループを占有しないのでハートビートも監視タスクも止まらない
+    - 個別の失敗は progress.error() に traceback を溜めて続行し、最初の失敗時に
+      ログ (.log) を Discord へ投稿する
+    """
     total_new, total_skip, total_err = 0, 0, 0
-    for i, entry in enumerate(lst):
+    n = len(entries)
+
+    for i, entry in enumerate(entries):
         login = entry["login"]
         if i > 0:
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(BATCH_ITEM_GAP_SECONDS)
+
+        progress.tick(f"({i+1}/{n}) {login}: 配信者情報を解決中")
+        sm = await bot._update_status(interaction, sm, f"🔄 ({i+1}/{n}) `{login}` の情報を確認中...")
 
         try:
-            sm = await bot._update_status(interaction, sm, f"🔄 ({i+1}/{len(lst)}) `{login}` の情報を確認中...")
             user_id = entry.get("user_id", "")
-            
-            ui = None
+
             try:
-                ui = bot.logger.resolve_streamer(login)
+                # resolve_streamer -> get_user_by_login -> 必要なら tracker 解決。
+                # いずれも同期 httpx なのでスレッドへ逃がす。
+                ui = await asyncio.to_thread(bot.logger.resolve_streamer, login)
             except Exception as api_err:
                 if "rate" in str(api_err).lower() or "limit" in str(api_err).lower() or "GQL" in str(api_err):
                     wait_sec = 30
+                    progress.note(f"⚠️ {login}: APIレート制限 -> {wait_sec}秒 待機して再試行")
                     sm = await bot._update_status(interaction, sm, f"⚠️ [APIレート制限回避] 待機中... **{wait_sec}秒間一時停止** します。")
                     await asyncio.sleep(wait_sec)
-                    ui = bot.logger.resolve_streamer(login)
+                    ui = await asyncio.to_thread(bot.logger.resolve_streamer, login)
                 else:
                     raise api_err
 
             if not ui and user_id:
-                ui = bot.logger.resolve_streamer_by_id(user_id)
+                ui = await asyncio.to_thread(bot.logger.resolve_streamer_by_id, user_id)
                 if ui:
                     new_login = ui.get("login", "")
                     if new_login and new_login != login:
                         entry["login"] = new_login
                         entry["display_name"] = ui.get("displayName", new_login)
-                        await bot._save_track_list(tracker_channel, lst)
+                        await bot._save_track_list(tracker_channel, entries)
                         login = new_login
             if not ui:
-                await interaction.channel.send(f"⚠️ `{login}` 解決不能のためスキップ")
+                progress.note(f"⚠️ {login}: 解決不能のためスキップ")
+                await _notify(interaction, f"⚠️ `{login}` 解決不能のためスキップ")
                 total_err += 1
                 continue
 
             dn = ui.get("displayName", login)
             uid = ui.get("id", user_id)
 
+            progress.tick(f"({i+1}/{n}) {login}: VOD一覧を取得中")
             try:
-                all_vods = bot.logger.twitch_api.get_all_vods(login, max_total=100, user_id=uid)
+                all_vods = await asyncio.to_thread(
+                    bot.logger.twitch_api.get_all_vods,
+                    login=login, max_total=100, user_id=uid,
+                )
             except Exception as api_err:
                 if "rate" in str(api_err).lower() or "limit" in str(api_err).lower() or "GQL" in str(api_err):
                     wait_sec = 30
+                    progress.note(f"⚠️ {login}: VOD一覧 APIレート制限 -> {wait_sec}秒 待機して再試行")
                     sm = await bot._update_status(interaction, sm, f"⚠️ [APIレート制限回避] 待機中... **{wait_sec}秒間一時停止** します。")
                     await asyncio.sleep(wait_sec)
-                    all_vods = bot.logger.twitch_api.get_all_vods(login, max_total=100, user_id=uid)
+                    all_vods = await asyncio.to_thread(
+                        bot.logger.twitch_api.get_all_vods,
+                        login=login, max_total=100, user_id=uid,
+                    )
                 else:
                     raise api_err
 
+            progress.note(f"{login}: VOD {len(all_vods)}件取得 -> 金庫チャンネルと突合")
+            progress.tick(f"({i+1}/{n}) {login}: 重複金庫と突合 ({len(all_vods)}件)")
             new_vods = [v for v in all_vods if not await bot._is_vod_uploaded_in_channel(dedup_channel, v["id"])]
             if not new_vods:
+                progress.note(f"{login}: 新VODなし")
                 total_skip += 1
                 continue
 
-            await interaction.channel.send(f"📋 `{login}` ({dn}): {len(new_vods)}件の新VODを発見 -> {dest_channel.mention}")
-            for v in new_vods:
-                if await bot._process_vod(interaction, v["id"], login, dn, v.get("title", ""), dest_channel=dest_channel, dedup_channel=dedup_channel):
+            progress.note(f"{login}: 新VOD {len(new_vods)}件発見")
+            await _notify(interaction, f"📋 `{login}` ({dn}): {len(new_vods)}件の新VODを発見 -> {dest_channel.mention}")
+            for j, v in enumerate(new_vods):
+                progress.tick(f"({i+1}/{n}) {login}: VOD {j+1}/{len(new_vods)} `{v['id']}` 処理中")
+                if await bot._process_vod(interaction, v["id"], login, dn, v.get("title", ""), dest_channel=dest_channel, dedup_channel=dedup_channel, status_msg=sm, vod_index=f"[{i+1}/{n}]"):
                     total_new += 1
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(BATCH_ITEM_GAP_SECONDS)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[!] track scan {login}: {tb}", file=sys.stderr)
-            await interaction.channel.send(f"❌ `{login}` 処理中にエラーが発生しました: {e}")
+            progress.error(f"❌ {login} 処理中にエラー ({type(e).__name__})", e, tb)
             total_err += 1
+            await _notify(
+                interaction,
+                f"❌ `{login}` 処理中にエラーが発生しました: {type(e).__name__}: {str(e)[:400]}\n"
+                f"```\n{tb[-900:]}\n```"
+            )
+            # 最初の失敗時点でログを全文投稿しておく (途中で止まっても読めるように)
+            if len(progress.errors) == 1:
+                await bot._send_batch_log(interaction, progress, channel=interaction.channel)
 
-    await bot._update_status(
-        interaction,
-        sm,
-        f"✅ ﾄﾗｯｷﾝｸﾞｽｷｬﾝ完了!\n"
-        f"{len(lst)}人処理\n"
-        f"🆕{total_new}件DL / ⏭️{total_skip}件ｽｷｯﾌﾟ / ❌{total_err}件ｴラー\n"
-        f"📂 保管庫: {dest_channel.mention} | 重複金庫: {dedup_channel.mention}"
-    )
+    return {
+        "ok": total_new, "skip": total_skip, "err": total_err, "people": n,
+        "status_msg": sm,
+    }
+
+
+@track_group.command(name="scan", description="トラッキングリストに登録されている全員の全未保存VODを一括自動取得")
+async def slash_track_scan(interaction: discord.Interaction):
+    try:
+        if not interaction.guild: return
+        await interaction.response.defer()
+        bot = bot_instance
+        tracker_channel = await bot._get_or_create_tracker_channel(interaction.guild)
+        lst = await bot._load_track_list(tracker_channel)
+        if not lst:
+            return await interaction.followup.send("📭 リストが空です。先に `/chat track add` で登録してください。")
+
+        sm = await interaction.followup.send(f"🔄 ﾄﾗｯｷﾝｸﾞｽｷｬﾝ開始 ({len(lst)}人) 新規VODを探します...")
+
+        dest_channel = await bot._get_or_create_archive_channel(interaction.guild)
+        dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
+        if not dest_channel or not dedup_channel:
+            return await interaction.followup.send("❌ 必要なチャンネルを取得できませんでした。")
+
+        started = time.time()
+        result = await bot._run_batch(
+            interaction,
+            title=f"track_scan_{interaction.guild.name}",
+            status_msg=sm,
+            channel=interaction.channel,
+            body=lambda progress: _track_scan_body(
+                bot, interaction, sm, lst, dest_channel, dedup_channel,
+                tracker_channel, progress,
+            ),
+        )
+        sm = result.get("status_msg", sm)
+
+        if result.get("aborted"):
+            await bot._update_status(
+                interaction, sm,
+                f"⛔ ﾄﾗｯｷﾝｸﾞｽｷｬﾝ中断 ({_format_duration(int(time.time() - started))}経過)\n"
+                f"   進捗が止まったため打ち切りました。原因は添付ログ (.log) を確認してください。\n"
+                f"   よくある原因: 巨大VODの圧縮 / Twitch API 無応答 / Discord API の長時間レート制限\n"
+                f"   📂 保管庫: {dest_channel.mention} | 重複金庫: {dedup_channel.mention}"
+            )
+            return
+
+        err_note = f"\n❌{result['err']}件ｴラー (詳細は添付ログ)" if result.get("err") else ""
+        await bot._update_status(
+            interaction,
+            sm,
+            f"✅ ﾄﾗｯｷﾝｸﾞｽｷｬﾝ完了! ({_format_duration(int(time.time() - started))})\n"
+            f"{result.get('people', len(lst))}人処理\n"
+            f"🆕{result.get('ok', 0)}件DL / ⏭️{result.get('skip', 0)}件ｽｷｯﾌﾟ / ❌{result.get('err', 0)}件ｴラー{err_note}\n"
+            f"📂 保管庫: {dest_channel.mention} | 重複金庫: {dedup_channel.mention}"
+        )
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # 起動準備 (~チャンネル取得 / ﾄﾗｯｸﾘｽﾄ読込) の失敗も Discord に出す。
+        # ここで握り潰すと Colab のログしか残らず「黙って止まった」ように見える。
+        tb = traceback.format_exc()
+        print(f"[!] track scan (setup): {tb}", file=sys.stderr)
+        await _notify(
+            interaction,
+            f"❌ ﾄﾗｯｷﾝｸﾞｽｷｬﾝを開始できません: {type(e).__name__}: {str(e)[:400]}\n"
+            f"```\n{tb[-900:]}\n```"
+        )
 
 
 # --- /chat repair ---
@@ -2050,31 +2541,26 @@ async def slash_repair(interaction: discord.Interaction, targets: str = "default
 
     status_msg = await bot._update_status(interaction, status_msg, f"⚠️ {len(broken_vods)} 件の不完全ログを検出。自動修復（再ダウンロード＆集約保存）を開始します...")
 
-    repaired_count = 0
-    for idx, (vod_id, info) in enumerate(broken_vods, 1):
-        prefix = f"🔧 [{idx}/{len(broken_vods)}]"
-        status_msg = await bot._update_status(interaction, status_msg, f"{prefix} VOD `{vod_id}` ({info['streamer_display_name']}) の修復準備中...")
-        
-        for ch, old_msg in archive_messages.get(vod_id, []):
-            try: await old_msg.delete()
-            except Exception: pass
-        try:
-            dedup_msg = await dedup_channel.fetch_message(info["dedup_msg_id"])
-            await dedup_msg.delete()
-        except Exception: pass
-        
-        bot.logger.db.remove_upload(vod_id)
-        if str(dedup_channel.id) in bot._scan_cache:
-            bot._scan_cache[str(dedup_channel.id)].discard(vod_id)
+    result = await bot._run_batch(
+        interaction,
+        title=f"repair_{interaction.guild.name}",
+        status_msg=status_msg,
+        channel=interaction.channel,
+        body=lambda progress: _repair_body(
+            bot, interaction, status_msg, broken_vods, archive_messages,
+            dest_channel, dedup_channel, progress,
+        ),
+    )
+    status_msg = result.get("status_msg", status_msg)
 
-        success = await bot._process_vod(
-            interaction, vod_id=vod_id, streamer_login=info["streamer_login"],
-            streamer_display=info["streamer_display_name"], stream_title=info["stream_title"],
-            dest_channel=dest_channel, dedup_channel=dedup_channel, status_msg=status_msg, vod_index=prefix
+    if result.get("aborted"):
+        return await bot._update_status(
+            interaction, status_msg,
+            f"⛔ 修復プロセスを中断しました (進捗が止まったため)\n"
+            f"   原因は Discord に投稿された添付ログ (.log) を確認してください。"
         )
-        if success: repaired_count += 1
-        await asyncio.sleep(2.5)
 
+    repaired_count = result.get("repaired", 0)
     await bot._update_status(
         interaction,
         status_msg,
@@ -2082,7 +2568,64 @@ async def slash_repair(interaction: discord.Interaction, targets: str = "default
         f"  検査対象チャンネル数: {len(channels_to_scan)} 件\n"
         f"  検出不完全VOD数: {len(broken_vods)} 件\n"
         f"  修復完了数: {repaired_count} 件"
+        + (f"\n  ❌ 失敗 {result.get('err', 0)} 件 (詳細は添付ログ)" if result.get("err") else "")
     )
+
+
+async def _repair_body(
+    bot: "TwitchChatBot",
+    interaction: discord.Interaction,
+    status_msg: Optional[discord.Message],
+    broken_vods: list[tuple[str, dict]],
+    archive_messages: dict,
+    dest_channel: discord.TextChannel,
+    dedup_channel: discord.TextChannel,
+    progress: BatchProgress,
+) -> dict:
+    """/chat repair の再取得ループ。track scan と同じく監視 + ログ投稿付き。"""
+    repaired_count = 0
+    err_count = 0
+    total = len(broken_vods)
+
+    for idx, (vod_id, info) in enumerate(broken_vods, 1):
+        prefix = f"🔧 [{idx}/{total}]"
+        progress.tick(f"({idx}/{total}) {vod_id} 修復準備 ({info['streamer_login']})")
+        status_msg = await bot._update_status(interaction, status_msg, f"{prefix} VOD `{vod_id}` ({info['streamer_display_name']}) の修復準備中...")
+
+        for ch, old_msg in archive_messages.get(vod_id, []):
+            try: await old_msg.delete()
+            except Exception: pass
+        try:
+            dedup_msg = await dedup_channel.fetch_message(info["dedup_msg_id"])
+            await dedup_msg.delete()
+        except Exception: pass
+
+        bot.logger.db.remove_upload(vod_id)
+        if str(dedup_channel.id) in bot._scan_cache:
+            bot._scan_cache[str(dedup_channel.id)].discard(vod_id)
+
+        try:
+            success = await bot._process_vod(
+                interaction, vod_id=vod_id, streamer_login=info["streamer_login"],
+                streamer_display=info["streamer_display_name"], stream_title=info["stream_title"],
+                dest_channel=dest_channel, dedup_channel=dedup_channel, status_msg=status_msg, vod_index=prefix
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[!] repair {vod_id}: {tb}", file=sys.stderr)
+            progress.error(f"❌ {vod_id} 修復中にエラー ({type(e).__name__})", e, tb)
+            err_count += 1
+            if len(progress.errors) == 1:
+                await bot._send_batch_log(interaction, progress, channel=interaction.channel)
+            success = False
+
+        if success:
+            repaired_count += 1
+        await asyncio.sleep(2.5)
+
+    return {"repaired": repaired_count, "err": err_count, "status_msg": status_msg}
 
 
 # --- /chat migrate ---

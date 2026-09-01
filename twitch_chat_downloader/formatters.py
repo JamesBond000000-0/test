@@ -7,12 +7,30 @@ from __future__ import annotations
 import json
 import gzip
 import io
+import os
 import re
 import zstandard as zstd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 from .gql_client import Comment
+
+
+VOD_ZSTD_LEVEL_DEFAULT = 22
+
+
+def get_vod_zstd_level() -> int:
+    """
+    VOD チャット圧縮の Zstd レベル (既定 22 = 変更なし)。
+
+    12 時間配信だと 22 は 1 ファイルで数十秒かかります。19 でもサイズは
+    1% 程度しか変わらず、体感はずいぶん速くなります (デイリーログ側は 19 既定)。
+    """
+    try:
+        level = int(os.environ.get("VOD_ZSTD_LEVEL", VOD_ZSTD_LEVEL_DEFAULT))
+    except (TypeError, ValueError):
+        return VOD_ZSTD_LEVEL_DEFAULT
+    return max(1, min(22, level))
 
 
 def format_json(
@@ -122,9 +140,9 @@ def format_json(
 
     json_bytes = json.dumps(output, ensure_ascii=False, indent=2).encode("utf-8")
 
-    # Zstd最高圧縮レベル22 (Ultra) での圧縮
+    # Zstd最高圧縮レベル (既定 22 = Ultra, 環境変数 VOD_ZSTD_LEVEL で変更可)
     if compression == "Zstd":
-        cctx = zstd.ZstdCompressor(level=22, write_checksum=True)
+        cctx = zstd.ZstdCompressor(level=get_vod_zstd_level(), write_checksum=True, threads=-1)
         return cctx.compress(json_bytes)
 
     elif compression == "Gzip":

@@ -25,7 +25,7 @@ from rich.progress import (
     TaskProgressColumn,
 )
 
-from .gql_client import TwitchGQLClient
+from .gql_client import TwitchGQLClient, VODUnavailableError
 from .formatters import format_json, format_text, format_html
 from .emote_service import EmoteService
 
@@ -255,6 +255,7 @@ def _chatdownload(
         video_created_at = None
         channel_id = None
         video_title = None
+        is_partial = False
 
         if content_type == "video":
             start_time = time.time()
@@ -277,7 +278,10 @@ def _chatdownload(
                     else:
                         progress.update(task, completed=latest_offset)
 
-                comments, video_created_at, channel_id, video_title = (
+                # download_video_chat returns 5 values (comments, created_at,
+                # channel_id, title, is_partial) - the old 4-tuple unpack raised
+                # "ValueError: too many values to unpack" on every CLI download.
+                comments, video_created_at, channel_id, video_title, is_partial = (
                     client.download_video_chat(
                         content_id,
                         trim_beginning=trim_beginning,
@@ -285,6 +289,10 @@ def _chatdownload(
                         progress_callback=progress_callback,
                     )
                 )
+                if is_partial:
+                    console.print(
+                        "[yellow]![/] Warning: chat may be incomplete (connection issues)."
+                    )
 
             elapsed = time.time() - start_time
             console.print(
@@ -396,6 +404,13 @@ def _chatdownload(
 
     except NotImplementedError:
         raise
+    except VODUnavailableError as e:
+        # 存在しない VOD (削除・保管期限切れ・非公開) はリトライで回復しない
+        console.print(f"[red]✗[/] {e}")
+        console.print(
+            "[dim]Twitch 上でこの VOD が見つかりません。再試行では回復しません。[/]"
+        )
+        raise typer.Exit(code=1)
     except Exception as e:
         raise RuntimeError(f"Failed to download chat: {e}") from e
     finally:
