@@ -84,6 +84,19 @@ class ChatLoggerDB:
                 source TEXT DEFAULT 'logs.zonian.dev'
             )
         """)
+        # 「記録済み日付なのに0件で返ってきた日」の再検証スケジューラ用テーブル。
+        # サーバー側の一時的な不調で空が返るケースがあるため、即座に「ログなし」と
+        # 決めつけず、一定間隔で再確認 -> 連続で空が続いたら初めて「ログなし」確定にする。
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_log_empty_checks (
+                log_id TEXT PRIMARY KEY,
+                channel_login TEXT,
+                log_date TEXT,
+                attempts INTEGER DEFAULT 1,
+                first_checked_at TEXT NOT NULL,
+                last_checked_at TEXT NOT NULL
+            )
+        """)
         self._conn.commit()
 
     def is_uploaded(self, vod_id: str) -> bool:
@@ -221,6 +234,56 @@ class ChatLoggerDB:
 
     def remove_log_upload(self, log_id: str):
         self._conn.execute("DELETE FROM daily_log_uploads WHERE log_id = ?", (log_id,))
+        self._conn.commit()
+
+    def get_log_upload(self, log_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM daily_log_uploads WHERE log_id = ?", (log_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        cols = [d[1] for d in self._conn.execute("PRAGMA table_info(daily_log_uploads)").fetchall()]
+        d = dict(zip(cols, row))
+        d["discord_message_ids"] = json.loads(d.get("discord_message_ids") or "[]")
+        return d
+
+    # ---- 「記録済みなのに0件」再検証スケジューラ ----
+
+    def get_empty_check(self, log_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM daily_log_empty_checks WHERE log_id = ?", (log_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        cols = [d[1] for d in self._conn.execute("PRAGMA table_info(daily_log_empty_checks)").fetchall()]
+        return dict(zip(cols, row))
+
+    def record_empty_check(self, log_id: str, channel_login: str, log_date: str) -> int:
+        """空チェックを1回記録し、累計試行回数を返す。"""
+        now = datetime.now(timezone.utc).isoformat()
+        row = self._conn.execute(
+            "SELECT attempts, first_checked_at FROM daily_log_empty_checks WHERE log_id = ?",
+            (log_id,),
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO daily_log_empty_checks "
+                "(log_id, channel_login, log_date, attempts, first_checked_at, last_checked_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                (log_id, channel_login.lower(), log_date, now, now),
+            )
+            self._conn.commit()
+            return 1
+        attempts = int(row[0] or 0) + 1
+        self._conn.execute(
+            "UPDATE daily_log_empty_checks SET attempts = ?, last_checked_at = ? WHERE log_id = ?",
+            (attempts, now, log_id),
+        )
+        self._conn.commit()
+        return attempts
+
+    def remove_empty_check(self, log_id: str):
+        self._conn.execute("DELETE FROM daily_log_empty_checks WHERE log_id = ?", (log_id,))
         self._conn.commit()
 
     def is_partial(self, vod_id: str) -> bool:

@@ -7,6 +7,8 @@ Commands:
   /chat logs download/days/scan       - Daily chat logs (logs.zonian.dev); `scan` batch-runs
                                         the whole tracking list (same list as track scan).
                                         `dest:` picks the archive channel (logs|archive|<id>)
+  /chat logs redownload               - Force re-download ignoring the dedup DB (purges old
+                                        entries first; use to fix wrong "no logs" records)
   /chat migrate <category_ids_or_channel_ids> - Migrate old data to the dedup channel
   /chat repair [targets] [excludes]  - Scan and auto-repair incomplete chat files
   /chat status / list / sync / help  - Other
@@ -37,6 +39,7 @@ from .gql_client import VODUnavailableError
 from . import logs_api
 from .logs_api import (
     LogsAPIError,
+    LogsEmptyMismatchError,
     ZonianLogsClient,
     build_day_document,
     compress_and_split,
@@ -59,6 +62,19 @@ DEDUP_CHANNEL_NAME = "twitch-chat-dedup"      # 重複判定記録用（Botの�
 LOGS_ARCHIVE_CHANNEL_NAME = "twitch-logs-archives"  # デイリーログ(zonian)保存用本棚
 TRACK_LIST_PREFIX = "📋 **Twitch配信者トラッキングリスト**"
 
+# 「記録済みなのに0件が返ってきた日」の再検証スケジュール (詳細は logs_api.py 参照)。
+# - 最後の確認から EMPTY_RECHECK_DAYS 日未満は再DLしない (サーバー負荷対策)
+# - 連続で EMPTY_ACCEPT_AFTER 回空が続いたら、初めて「ログなし」確定にして重複DBへ登録
+#   (それまでは登録しない = いつデータが出現しても保存できる)
+try:
+    EMPTY_RECHECK_DAYS = max(float(os.environ.get("LOGS_EMPTY_RECHECK_DAYS", 3.0)), 0.0)
+except (TypeError, ValueError):
+    EMPTY_RECHECK_DAYS = 3.0
+try:
+    EMPTY_ACCEPT_AFTER = max(int(os.environ.get("LOGS_EMPTY_ACCEPT_AFTER", 5)), 2)
+except (TypeError, ValueError):
+    EMPTY_ACCEPT_AFTER = 5
+
 JST = logs_api.JST
 
 DESCRIPTION = (
@@ -73,9 +89,10 @@ DESCRIPTION = (
     "`/chat track scan` - 登録配信者の全VODを一括スキャンDL\n"
     "`/chat migrate <ids>` - 旧チャンネル内の動画を新データベースへポインタ移行\n"
     "`/chat repair [targets] [excludes]` - 欠落パーツのVODを検出し自動修復DL\n"
-    "`/chat logs download <streamer>` - デイリーチャットログ(zonian)を1日ずつDL\n"
+    "`/chat logs download <streamer>` - デイリーチャットログ(zonian)を1日ずつDL (`force:True` で再DL)\n"
+    "`/chat logs redownload <streamer>` - 重複DBの記録を消去して強制再DL (誤った「ログなし」登録の修正用)\n"
     "`/chat logs days <streamer>` - DL可能日数・保存状況を表示\n"
-    "`/chat logs scan` - トラッキングリスト全員のデイリーログを一括DL\n"
+    "`/chat logs scan` - トラッキングリスト全員のデイリーログを一括DL (`force:True` で再DL)\n"
     "`/chat logs download|scan dest:archive` - 保存先をVOD本棚に同居 (チャンネル数上限対策)\n"
     "`/chat list [streamer]` - アップロード済みVOD一覧\n"
     "`/chat status` - Botステータス確認\n"
@@ -1406,6 +1423,108 @@ class TwitchChatBot(commands.Bot):
 
     # ---- Daily Chat Logs (logs.zonian.dev) ----
 
+    def _decide_empty_recheck(self, log_id: str, channel_login: str, day_str: str) -> dict:
+        """
+        「サーバーの記録日一覧にあるのに0件が返ってきた」日の扱いを決める。
+
+        戻り値: {"accept": bool, "note": str}
+          accept=True  ... 空の再確認が十分繰り返された -> 「ログなし」確定にしてよい
+          accept=False ... まだ確定しない -> 重複DBに登録せず次回以降に再検証する
+        """
+        db = self.logger.db
+        row = db.get_empty_check(log_id)
+        if row is not None:
+            try:
+                last = datetime.fromisoformat(row["last_checked_at"])
+                age_days = (datetime.now(timezone.utc) - last).total_seconds() / 86400.0
+            except (KeyError, TypeError, ValueError):
+                age_days = EMPTY_RECHECK_DAYS
+            if age_days < EMPTY_RECHECK_DAYS:
+                return {
+                    "accept": False,
+                    "note": (
+                        f"最近({age_days:.1f}日前)に確認済のため今回はスキップ "
+                        f"({EMPTY_RECHECK_DAYS:g}日ごとに再チェック)"
+                    ),
+                }
+
+        attempts = db.record_empty_check(log_id, channel_login, day_str)
+        if attempts >= EMPTY_ACCEPT_AFTER:
+            db.remove_empty_check(log_id)
+            return {
+                "accept": True,
+                "note": f"空の再確認が{attempts}回連続 -> 「ログなし」確定として登録します",
+            }
+        return {
+            "accept": False,
+            "note": (
+                f"「ログなし」とは登録せず次回以降に再検証します "
+                f"(空の確認 {attempts}/{EMPTY_ACCEPT_AFTER}回・{EMPTY_RECHECK_DAYS:g}日ごと)"
+            ),
+        }
+
+    async def _purge_log_records(
+        self,
+        dedup_channel: discord.TextChannel,
+        dest_channel: discord.TextChannel,
+        log_id: str,
+    ) -> int:
+        """
+        強制再DLの前に古い記録を消去する (誤った「ログなし」登録の修正用)。
+
+        - ローカル重複DBの行を削除
+        - インメモリキャッシュから削除
+        - 紐づくDiscordメッセージ (重複金庫の🔑エントリ / 本棚の📭・📅エントリ) を削除
+
+        戻り値: 削除できたDiscordメッセージ数
+        """
+        deleted = 0
+
+        row = self.logger.db.get_log_upload(log_id)
+        msg_ids = list((row or {}).get("discord_message_ids") or [])
+        self.logger.db.remove_log_upload(log_id)
+        self.logger.db.remove_empty_check(log_id)
+
+        cid = str(dedup_channel.id)
+        cache = self._logs_scan_cache.get(cid)
+        if cache is not None:
+            cache.discard(log_id)
+
+        # 探索候補チャンネル: 重複金庫 -> 保存先 -> ローカルDBに記録されたチャンネル
+        candidates: list[discord.TextChannel] = [dedup_channel, dest_channel]
+        recorded_cid = (row or {}).get("discord_channel_id")
+        if recorded_cid:
+            try:
+                ch = self.get_channel(int(recorded_cid))
+                if ch is not None and ch not in candidates:
+                    candidates.append(ch)
+            except (TypeError, ValueError):
+                pass
+
+        for mid in msg_ids:
+            try:
+                mid_int = int(mid)
+            except (TypeError, ValueError):
+                continue
+            for ch in candidates:
+                try:
+                    msg = await ch.fetch_message(mid_int)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+                except Exception:
+                    break
+                try:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.3)  # レート制限回避
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException as e:
+                    print(f"[!] purge delete failed ({mid}): {e}")
+                break
+
+        return deleted
+
     async def _process_day_log(
         self,
         interaction: discord.Interaction,
@@ -1428,16 +1547,59 @@ class TwitchChatBot(commands.Bot):
         u_label = f" (user: {user_filter})" if user_filter else ""
 
         try:
+            # 「空の再検証待ち」の日: 前回チェックから再検証日が来ていなければ、
+            # サーバーに問い合わせず次回まで待機する (負荷対策)。
+            ec = self.logger.db.get_empty_check(log_id)
+            if ec is not None:
+                try:
+                    last = datetime.fromisoformat(ec["last_checked_at"])
+                    age_days = (datetime.now(timezone.utc) - last).total_seconds() / 86400.0
+                except (KeyError, TypeError, ValueError):
+                    age_days = EMPTY_RECHECK_DAYS  # 壊れていたら即再チェック
+                if age_days < EMPTY_RECHECK_DAYS:
+                    attempts = int(ec.get("attempts") or 0)
+                    await self._update_status(
+                        interaction, status_msg,
+                        f"{prefix}⏳ `{channel_login}` {day_str} 空の再検証待ち "
+                        f"(確認{attempts}回/{EMPTY_ACCEPT_AFTER}回・再チェックは{EMPTY_RECHECK_DAYS:g}日ごと)"
+                    )
+                    return False
+
             status_msg = await self._update_status(
                 interaction, status_msg,
                 f"{prefix}⬇️ `{channel_login}` {day_str}{u_label} ﾛｸﾞDL開始..."
             )
 
-            # 1日分のチャットを取得 (イベントループをブロックしないようスレッドへ)
-            messages = await asyncio.to_thread(self.zonian.fetch_day, channel_login, day)
+            # 1日分のチャットを取得 (イベントループをブロックしないようスレッドへ)。
+            # 記録済み日付なのに空が返ってきた場合は、fetch_day の中で再検証
+            # (channelidルートへのフォールバック / 待機後の再取得) が行われ、
+            # それでも空なら LogsEmptyMismatchError になる (= サーバー側の一時的不調疑い)。
+            # progress_cb: バッチ実行中は巨大ファイルのDL/待機中も進捗を報告し続け、
+            # 停滞監視 (ストールモニター) が誤って中断しないようにする。
+            empty_mismatch_note = ""
+            try:
+                raw_messages = await asyncio.to_thread(
+                    self.zonian.fetch_day, channel_login, day,
+                    channel_id=channel_id, recorded_day=True,
+                    progress_cb=_batch_tick,
+                )
+            except LogsEmptyMismatchError as mismatch:
+                verdict = self._decide_empty_recheck(log_id, channel_login, day_str)
+                if not verdict["accept"]:
+                    # まだ「ログなし」確定にしない -> 重複DBに登録せず次回の再検証に回す
+                    await self._update_status(
+                        interaction, status_msg,
+                        f"{prefix}⚠️ `{channel_login}` {day_str} {mismatch}\n"
+                        f"   └ {verdict['note']}"
+                    )
+                    return False
+                raw_messages = []
+                empty_mismatch_note = "\n**備考:** 再検証で複数回0件が続いたため「ログなし」として確定"
 
             if user_filter:
-                messages = filter_messages_by_user(messages, user_filter)
+                messages = filter_messages_by_user(raw_messages, user_filter)
+            else:
+                messages = raw_messages
 
             message_count = len(messages)
             parts: list[dict] = []
@@ -1448,13 +1610,18 @@ class TwitchChatBot(commands.Bot):
                     user_filter=user_filter,
                 )
                 base_name = make_base_name(channel_login, day, user_filter)
-                parts = await asyncio.to_thread(compress_and_split, document, base_name)
+                parts = await asyncio.to_thread(
+                    compress_and_split, document, base_name,
+                    BOT_UPLOAD_LIMIT, _batch_tick,
+                )
 
             total_size = sum(p["size"] for p in parts)
             elapsed = time.time() - start_time
 
             if message_count == 0:
-                # 0件の日も重複回避DBに登録する (VODの「チャットなし」と同じ方式)
+                # 0件の日も重複回避DBに登録する (VODの「チャットなし」と同じ方式)。
+                # ただし「記録済みなのに空」の再検証で確定した場合のみ。
+                # 検証未確定の空は上の LogsEmptyMismatchError 側でスキップ済み。
                 embed = discord.Embed(
                     title="📅 Twitch Daily Chat Log (0件)",
                     description=(
@@ -1463,6 +1630,7 @@ class TwitchChatBot(commands.Bot):
                         f"**JST範囲:** {day_jst_range_text(day)}\n"
                         f"**メッセージ数:** 0件{u_label}\n"
                         f"**ソース:** {logs_api.LOG_SOURCE_NAME}"
+                        f"{empty_mismatch_note}"
                     ),
                     color=0x9146FF,
                 )
@@ -1536,6 +1704,8 @@ class TwitchChatBot(commands.Bot):
                     message_ids.insert(0, dedup_msg_id)
 
             # ローカルDBに記録 + スキャンキャッシュ更新
+            # (データが存在するDLが成功したので、空再検証の途中経過が残っていれば消す)
+            self.logger.db.remove_empty_check(log_id)
             self.logger.db.record_log_upload(log_id, {
                 "channel_login": channel_login,
                 "channel_display_name": channel_display,
@@ -2008,31 +2178,25 @@ async def slash_download(interaction: discord.Interaction, streamer: str, vod_id
         await interaction.followup.send(f"❌ エラー: {e}")
 
 
-# --- /chat logs download ---
-@logs_group.command(name="download", description="デイリーチャットログ(zonian)を1日ずつDL→圧縮→保管 (確定済みの日のみ)")
-@app_commands.describe(
-    channel="配信者のユーザー名 (Login ID)",
-    user="特定ユーザーの発言のみ抽出 (省略可)",
-    date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
-    date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
-    limit="最大DL日数 (省略時: 全件)",
-    force="重複チェックを無視して再DL (省略時: 無効)",
-    dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
-)
-async def slash_logs_download(
+# --- /chat logs download / redownload ---
+
+async def _logs_download_flow(
     interaction: discord.Interaction,
     channel: str,
-    user: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    limit: Optional[int] = None,
-    force: bool = False,
-    dest: Optional[str] = None,
-):
-    if not interaction.guild:
-        return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
+    user: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    limit: Optional[int],
+    force: bool,
+    dest: Optional[str],
+) -> None:
+    """
+    /chat logs download と /chat logs redownload の共通本体。
 
-    await interaction.response.defer()
+    force=True の場合は重複チェックを無視して再DLする。さらに再DLの前に
+    古い記録 (重複金庫の🔑エントリ / 本棚のアーカイブ / ローカルDB行) を
+    消去するため、誤って「ログなし」登録されてしまった日の修正にも使える。
+    """
     bot = bot_instance
 
     dest_channel, dest_note = await bot._resolve_logs_dest_channel(interaction.guild, dest)
@@ -2070,9 +2234,10 @@ async def slash_logs_download(
         pass
 
     u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
+    force_label = " / 🔁 強制再DLモード (旧記録は消去されます)" if force else ""
     note_line = f"{dest_note}\n" if dest_note else ""
     status_msg = await interaction.followup.send(
-        f"{note_line}🔎 `{display}` のデイリーログ情報を取得中... (ソース: logs.zonian.dev){u_label}"
+        f"{note_line}🔎 `{display}` のデイリーログ情報を取得中... (ソース: logs.zonian.dev){u_label}{force_label}"
     )
 
     try:
@@ -2122,18 +2287,27 @@ async def slash_logs_download(
 
     total_new = len(pending)
     oldest, newest = pending[0], pending[-1]
+    head = "🔁 強制再DL" if force else "📋 未DL"
     status_msg = await bot._update_status(
         interaction,
         status_msg,
-        f"📋 `{display}` 未DL {total_new}日発見{u_label}\n"
+        f"{head} `{display}` 対象 {total_new}日{u_label}\n"
         f"   保管先: {dest_channel.mention}\n"
         f"   期間: {oldest:%Y-%m-%d} ～ {newest:%Y-%m-%d} (UTC / 古い順にDL開始)\n"
         f"   ⏭️ 保存済み{skipped}日 ｽｷｯﾌﾟ / 未終了{len(incomplete_days)}日 対象外"
     )
 
     ok_count = 0
+    purged_total = 0
     for i, d in enumerate(pending):
         day_idx = f"[{i+1}/{total_new}]"
+        if force:
+            # 再DLの前に古い記録 (重複金庫/本棚/ローカルDB) を消去して重複を防ぐ
+            log_id = make_log_id(channel_login, user_clean, d.isoformat())
+            try:
+                purged_total += await bot._purge_log_records(dedup_channel, dest_channel, log_id)
+            except Exception as e:
+                print(f"[!] purge failed for {log_id}: {e}", file=sys.stderr)
         if await bot._process_day_log(
             interaction, channel_login, display, channel_id, d,
             dest_channel=dest_channel, dedup_channel=dedup_channel,
@@ -2144,13 +2318,73 @@ async def slash_logs_download(
         if i < len(pending) - 1:
             await asyncio.sleep(2.5)
 
+    purge_note = f" / 🧹 旧記録{purged_total}件 消去" if force else ""
     await bot._update_status(
         interaction,
         status_msg,
-        f"📊 `{display}` 完了: {ok_count}日成功 / {total_new}日中{u_label}\n"
+        f"📊 `{display}` 完了: {ok_count}日成功 / {total_new}日中{u_label}{purge_note}\n"
         f"⏭️ 保存済み{skipped}日 ｽｷｯﾌﾟ / 未終了{len(incomplete_days)}日 対象外\n"
         f"📂 チャンネル: {dest_channel.mention}"
     )
+
+
+@logs_group.command(name="download", description="デイリーチャットログ(zonian)を1日ずつDL→圧縮→保管 (確定済みの日のみ)")
+@app_commands.describe(
+    channel="配信者のユーザー名 (Login ID)",
+    user="特定ユーザーの発言のみ抽出 (省略可)",
+    date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
+    date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
+    limit="最大DL日数 (省略時: 全件)",
+    force="重複チェックを無視して強制再DL (旧記録は消去 / 省略時: 無効)",
+    dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
+)
+async def slash_logs_download(
+    interaction: discord.Interaction,
+    channel: str,
+    user: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: Optional[int] = None,
+    force: bool = False,
+    dest: Optional[str] = None,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
+
+    await interaction.response.defer()
+    await _logs_download_flow(interaction, channel, user, date_from, date_to, limit, force, dest)
+
+
+@logs_group.command(
+    name="redownload",
+    description="重複回避DBを無視して強制再DL (誤った「ログなし」登録の修正用・旧記録は消去されます)",
+)
+@app_commands.describe(
+    channel="配信者のユーザー名 (Login ID)",
+    user="特定ユーザーの発言のみ抽出 (省略可)",
+    date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
+    date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
+    limit="最大再DL日数 (省略時: 期間内の全件)",
+    dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
+)
+async def slash_logs_redownload(
+    interaction: discord.Interaction,
+    channel: str,
+    user: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: Optional[int] = None,
+    dest: Optional[str] = None,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
+
+    await interaction.response.defer()
+    await interaction.followup.send(
+        "🔁 **強制再DLモード** - 重複回避DBの記録を消去して再ダウンロードします。\n"
+        "└ 古い「ログなし」登録・アーカイブメッセージも消去の対象です。"
+    )
+    await _logs_download_flow(interaction, channel, user, date_from, date_to, limit, True, dest)
 
 
 # --- /chat logs days ---
@@ -2373,6 +2607,13 @@ async def _logs_scan_body(
                 progress.tick(
                     f"({i+1}/{n}) {login}: {d:%Y-%m-%d} ({j+1}/{len(pending)}) DL中"
                 )
+                if force:
+                    # 強制再DL: 古い記録 (重複金庫/本棚/ローカルDB) を消去してから再取得
+                    log_id = make_log_id(login, user_filter, d.isoformat())
+                    try:
+                        await bot._purge_log_records(dedup_channel, dest_channel, log_id)
+                    except Exception as e:
+                        progress.note(f"⚠️ {login} {d:%Y-%m-%d}: 旧記録の消去に失敗 ({type(e).__name__}: {e})")
                 ok = await bot._process_day_log(
                     interaction, login, display, channel_id, d,
                     dest_channel=dest_channel, dedup_channel=dedup_channel,
@@ -2420,7 +2661,7 @@ async def _logs_scan_body(
     date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
     date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
     limit="1人あたりの最大DL日数 (省略時: 全件)",
-    force="重複チェックを無視して再DL (省略時: 無効)",
+    force="重複チェックを無視して強制再DL (旧記録は消去 / 省略時: 無効)",
     dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
 )
 async def slash_logs_scan(

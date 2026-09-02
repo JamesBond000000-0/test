@@ -26,8 +26,37 @@ import httpx
 # ---- Constants / Configuration ----
 
 DEFAULT_BASE_URL = "https://logs.zonian.dev"
-DEFAULT_TIMEOUT_SECONDS = 120.0          # 1日分が大きい場合があるため長め
-DEFAULT_MAX_RETRIES = 3
+
+# 巨大な1日分 (実測で200MB超のJSONあり) のDL対策:
+# - read timeout は「データが完全に止まって」から諦めるまでの時間。
+#   ストリーミングDL中はバイトが流れ続けている限りタイマーがリセットされるため、
+#   巨大ファイルでも途中で切れない。サーバー混雑時のストールに耐えるよう長めに設定。
+# - すべて環境変数で調整可能。
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+DEFAULT_TIMEOUT_SECONDS = _env_float("LOGS_API_TIMEOUT", 300.0)        # 読み出し(ストール検知)タイムアウト
+DEFAULT_CONNECT_TIMEOUT = _env_float("LOGS_API_CONNECT_TIMEOUT", 15.0)  # 接続タイムアウト
+DEFAULT_MAX_RETRIES = _env_int("LOGS_API_MAX_RETRIES", 4)              # 再試行回数 (初回+4回)
+DEFAULT_MAX_DOWNLOAD_SECONDS = _env_float("LOGS_API_MAX_DOWNLOAD_SECONDS", 3600.0)  # 1回あたりの全体上限
+STREAM_CHUNK_SIZE = 1024 * 1024  # 1MB 単位でストリーミング
+
+# 「記録済みとされている日なのに中身が空だった」場合の再検証設定。
+# ミラーの裏のインスタンスが一時的に落ちていると空/404が返ることがあるため、
+# 即座に「ログなし」とは決めつけず、時間をおいて再確認する。
+EMPTY_RECHECK_DELAY_SECONDS = _env_float("LOGS_EMPTY_RECHECK_DELAY", 10.0)
+EMPTY_RECHECK_ATTEMPTS = _env_int("LOGS_EMPTY_RECHECK_ATTEMPTS", 2)
 
 # 「確実に1日が終わっている」判定のための安全マージン (時間)。
 # UTC 0時を過ぎてもインスタンス側の書き込み/集約が遅れる可能性を考慮。
@@ -68,6 +97,15 @@ def get_safety_margin_hours() -> float:
 
 class LogsAPIError(RuntimeError):
     """logs.zonian.dev API のエラー。"""
+
+
+class LogsEmptyMismatchError(LogsAPIError):
+    """
+    サーバーの記録日一覧には存在する日なのに、実ログ取得が空(0件/404)だった。
+
+    サーバー側(ミラー配下のログインスタンス)の一時的な不調の可能性が高いため、
+    「ログなし」として重複回避DBに登録せず、後日あらためてDLし直すのが安全。
+    """
 
 
 def make_log_id(channel: str, user_filter: Optional[str], day: str) -> str:
@@ -118,35 +156,122 @@ class ZonianLogsClient:
     def __init__(self, base_url: Optional[str] = None, timeout: float = DEFAULT_TIMEOUT_SECONDS):
         self.base_url = base_url or get_base_url()
         self.timeout = timeout
+        self._timeout_config = httpx.Timeout(
+            connect=DEFAULT_CONNECT_TIMEOUT,
+            read=timeout,
+            write=60.0,
+            pool=60.0,
+        )
         self._client = httpx.Client(
             base_url=self.base_url,
-            timeout=timeout,
+            timeout=self._timeout_config,
             headers={
-                "User-Agent": "twitch-chat-downloader/1.1 (Discord bot; daily chat logs)",
+                "User-Agent": "twitch-chat-downloader/1.2 (Discord bot; daily chat logs)",
                 "Accept": "application/json",
             },
         )
 
     # ---- Low-level ----
 
-    def _request(self, path: str) -> httpx.Response:
-        """リトライ (指数バックオフ) 付きGET。429/5xx/タイムアウトで再試行。"""
+    @staticmethod
+    def retry_wait_seconds(attempt: int) -> float:
+        """リトライ前の待機時間 (指数バックオフ): 5, 10, 20, 40, 60(上限)..."""
+        return float(min(5.0 * (2 ** attempt), 60.0))
+
+    def _read_timeout_for(self, attempt: int) -> float:
+        """試行ごとにreadタイムアウトを段階的に伸ばす (巨大ファイル対策)。"""
+        return self.timeout * (attempt + 1)
+
+    def _stream_get(self, path: str, read_timeout: float, progress_cb=None) -> tuple[int, bytes]:
+        """
+        GET をストリーミングで実行し、本文全体をバイト列で返す。
+
+        - バイトが流れている限りタイムアウトしない (チャンクごとにreadタイマー更新)。
+        - 完全にストールして read_timeout 秒応答がなければ ReadTimeout になる。
+        - 1試行あたりの全体上限 (DEFAULT_MAX_DOWNLOAD_SECONDS) も監視する。
+        - 巨大レスポンスは進捗を標準出力 (+ progress_cb) に出す
+          (バッチの停滞監視の手がかり)。
+        """
+        def note(text: str) -> None:
+            print(f"[logs] {text}")
+            if progress_cb is not None:
+                try:
+                    progress_cb(text)
+                except Exception:
+                    pass
+
+        timeout_cfg = httpx.Timeout(
+            connect=DEFAULT_CONNECT_TIMEOUT,
+            read=read_timeout,
+            write=60.0,
+            pool=60.0,
+        )
+        started = time.time()
+        deadline = started + max(DEFAULT_MAX_DOWNLOAD_SECONDS, read_timeout)
+        received = 0
+        last_log = started
+        with self._client.stream("GET", path, timeout=timeout_cfg) as resp:
+            status = resp.status_code
+            if status == 404:
+                resp.read()
+                return status, b""
+            if status == 429 or status >= 500:
+                resp.read()
+                raise LogsAPIError(f"HTTP {status} from {path}")
+            if status != 200:
+                resp.read()
+                raise LogsAPIError(f"HTTP {status} from {path} (未対応のステータス)")
+            buf = bytearray()
+            for chunk in resp.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                buf.extend(chunk)
+                received += len(chunk)
+                now = time.time()
+                if now - last_log >= 10.0:
+                    note(f"{path} 受信中... {received/1024/1024:.1f}MB / {now-started:.0f}秒")
+                    last_log = now
+                if now > deadline:
+                    raise LogsAPIError(
+                        f"DL全体が制限時間({DEFAULT_MAX_DOWNLOAD_SECONDS:.0f}秒)を超過 "
+                        f"({received/1024/1024:.1f}MB受信済み): {path}"
+                    )
+            if received > 5 * 1024 * 1024:
+                note(f"{path} 受信完了 {received/1024/1024:.1f}MB / {time.time()-started:.1f}秒")
+            return status, bytes(buf)
+
+    def _request(self, path: str, progress_cb=None) -> tuple[int, bytes]:
+        """
+        リトライ (指数バックオフ) 付きGET。タイムアウト/接続エラー/429/5xxで再試行。
+        404 は即座に返す (データ無し = リトライ不要)。
+
+        戻り値: (status_code, body_bytes)
+        """
         last_error: Optional[Exception] = None
         for attempt in range(DEFAULT_MAX_RETRIES + 1):
+            read_timeout = self._read_timeout_for(attempt)
             try:
-                resp = self._client.get(path)
-                if resp.status_code == 404:
-                    return resp  # 404はリトライしない (データ無し)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    raise LogsAPIError(f"HTTP {resp.status_code} from {path}")
-                return resp
+                return self._stream_get(path, read_timeout, progress_cb)
             except (httpx.TimeoutException, httpx.TransportError, LogsAPIError) as e:
                 last_error = e
                 if attempt < DEFAULT_MAX_RETRIES:
-                    wait = 3.0 * (attempt + 1)
-                    print(f"[logs] {path} 失敗 ({e}) -> {wait:.0f}秒後に再試行 ({attempt+1}/{DEFAULT_MAX_RETRIES})")
+                    wait = self.retry_wait_seconds(attempt)
+                    print(
+                        f"[logs] {path} 失敗 ({e}) -> {wait:.0f}秒後に再試行 "
+                        f"({attempt+1}/{DEFAULT_MAX_RETRIES}) [timeout {read_timeout:.0f}s]"
+                    )
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(f"{path} ﾘﾄﾗｲ待機 {wait:.0f}s ({attempt+1}/{DEFAULT_MAX_RETRIES})")
+                        except Exception:
+                            pass
                     time.sleep(wait)
         raise LogsAPIError(f"APIリクエスト失敗: {path} ({last_error})")
+
+    @staticmethod
+    def _parse_json(body: bytes, path: str) -> dict:
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            raise LogsAPIError(f"APIレスポンスの解析に失敗しました: {path}")
 
     # ---- Public API ----
 
@@ -170,14 +295,11 @@ class ZonianLogsClient:
         user_clean = (user or "").strip().lower().lstrip("@") or None
         path = f"/api/{channel_clean}" + (f"/{user_clean}" if user_clean else "")
 
-        resp = self._request(path)
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            raise LogsAPIError(f"APIレスポンスの解析に失敗しました (HTTP {resp.status_code})")
+        status, body = self._request(path)
+        data = self._parse_json(body, path)
 
-        if resp.status_code == 404 or data.get("error"):
-            err = data.get("error") or f"HTTP {resp.status_code}"
+        if status == 404 or data.get("error"):
+            err = data.get("error") or f"HTTP {status}"
             raise LogsAPIError(f"チャンネル `{channel_clean}` のログが見つかりません: {err}")
 
         available = data.get("available") or {}
@@ -218,30 +340,87 @@ class ZonianLogsClient:
             "instances": ((data.get("channelLogs") or {}).get("instances")) or [],
         }
 
-    def fetch_day(self, channel: str, day: date) -> list[dict]:
-        """
-        GET /channel/{ch}/{y}/{m}/{d}?json=true - 指定日(UTC)のチャンネル全体の
-        チャットログを取得。メッセージが1件も無い日は空リストを返す。
-        """
-        channel_clean = channel.strip().lower().lstrip("@")
-        path = f"/channel/{channel_clean}/{day.year}/{day.month}/{day.day}?json=true"
-
-        resp = self._request(path)
-        if resp.status_code == 404:
+    def _fetch_day_once(self, path: str, day: date, progress_cb=None) -> list[dict]:
+        """指定パスから1日分のメッセージを取得 (404は空リスト)。"""
+        status, body = self._request(path, progress_cb)
+        if status == 404:
             return []  # その日のログなし
 
-        if resp.status_code != 200:
-            raise LogsAPIError(f"{day:%Y-%m-%d} の取得失敗: HTTP {resp.status_code}")
-
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            raise LogsAPIError(f"{day:%Y-%m-%d} のレスポンス解析に失敗しました")
-
+        data = self._parse_json(body, path)
         messages = data.get("messages")
         if not isinstance(messages, list):
             raise LogsAPIError(f"{day:%Y-%m-%d} のレスポンス形式が不正です")
         return messages
+
+    def fetch_day(
+        self,
+        channel: str,
+        day: date,
+        channel_id: Optional[str] = None,
+        recorded_day: bool = False,
+        progress_cb=None,
+    ) -> list[dict]:
+        """
+        GET /channel/{ch}/{y}/{m}/{d}?json=true - 指定日(UTC)のチャンネル全体の
+        チャットログを取得。メッセージが1件も無い日は空リストを返す。
+
+        recorded_day:
+          サーバー側の「記録済み日付一覧」に載っている日の場合に True。
+          True なのに取得結果が空だった場合、ミラー配下のインスタンスの一時的な
+          不調の可能性が高いため、次の再検証を行う:
+            1) /channelid/{id} 経由で再取得 (別ルートで解決される場合がある)
+            2) 少し待ってから /channel/ 経由で再取得 (EMPTY_RECHECK_ATTEMPTS 回)
+          それでも空なら LogsEmptyMismatchError を送出する。呼び出し側 (Bot) は
+          これを「ログなし」として重複回避DBに登録せず、後日再試行すべき。
+        """
+        def note(text: str) -> None:
+            print(f"[logs] {text}")
+            if progress_cb is not None:
+                try:
+                    progress_cb(text)
+                except Exception:
+                    pass
+
+        channel_clean = channel.strip().lower().lstrip("@")
+        path = f"/channel/{channel_clean}/{day.year}/{day.month}/{day.day}?json=true"
+
+        messages = self._fetch_day_once(path, day, progress_cb)
+        if messages or not recorded_day:
+            return messages
+
+        # ---- ここから先: 記録済みのはずなのに空 -> 一時的なサーバー不調と疑う ----
+        note(f"{channel_clean} {day:%Y-%m-%d}: 記録済み日付なのに0件 -> 再検証します")
+
+        # 1) チャンネルID経由の別ルートで再取得
+        if channel_id:
+            id_path = f"/channelid/{channel_id}/{day.year}/{day.month}/{day.day}?json=true"
+            try:
+                messages = self._fetch_day_once(id_path, day, progress_cb)
+                if messages:
+                    note(f"{channel_clean} {day:%Y-%m-%d}: channelid 経由で {len(messages)}件 取得できた")
+                    return messages
+            except LogsAPIError as e:
+                note(f"channelid 経由の再取得も失敗: {e}")
+
+        # 2) 時間をおいて数回再取得 (インスタンス復旧を待つ)
+        for i in range(max(EMPTY_RECHECK_ATTEMPTS, 0)):
+            wait = EMPTY_RECHECK_DELAY_SECONDS * (i + 1)
+            note(f"{channel_clean} {day:%Y-%m-%d}: {wait:.0f}秒待機して再取得 ({i+1}/{EMPTY_RECHECK_ATTEMPTS})")
+            time.sleep(wait)
+            try:
+                messages = self._fetch_day_once(path, day, progress_cb)
+            except LogsAPIError as e:
+                note(f"再取得失敗: {e}")
+                continue
+            if messages:
+                note(f"{channel_clean} {day:%Y-%m-%d}: 再取得で {len(messages)}件 取得できた")
+                return messages
+
+        raise LogsEmptyMismatchError(
+            f"{day:%Y-%m-%d} はサーバーの記録日一覧に存在しますが、ログ取得は0件でした "
+            f"(再検証{EMPTY_RECHECK_ATTEMPTS + (1 if channel_id else 0)}回後も空)。"
+            f"サーバー側の一時的な不調の可能性があるため「ログなし」として登録せずスキップします。"
+        )
 
     def close(self):
         self._client.close()
@@ -297,16 +476,28 @@ def compress_and_split(
     document: dict,
     base_name: str,
     max_upload_size: int = BOT_UPLOAD_LIMIT,
+    progress_cb=None,
 ) -> list[dict]:
     """
     ドキュメントを Zstd で圧縮し、アップロード上限を超える場合は
     メッセージ単位で分割する (chat_logger の VOD分割と同じ方式・命名規則)。
     """
+    def note(text: str) -> None:
+        print(f"[logs] {text}")
+        if progress_cb is not None:
+            try:
+                progress_cb(text)
+            except Exception:
+                pass
+
     target_size = int(max_upload_size * 0.9)
     cctx = zstd.ZstdCompressor(level=get_zstd_level(), write_checksum=True, threads=-1)
 
     full_json = json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8")
+    note(f"{base_name}: 圧縮開始 (元 {len(full_json)/1024/1024:.1f}MB / zstd lv{get_zstd_level()})")
+    t0 = time.time()
     compressed = cctx.compress(full_json)
+    note(f"{base_name}: 圧縮完了 {len(compressed)/1024/1024:.1f}MB / {time.time()-t0:.0f}秒")
 
     if len(compressed) <= target_size:
         return [{
