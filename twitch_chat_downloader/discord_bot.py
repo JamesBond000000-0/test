@@ -4,6 +4,8 @@ Discord Bot for archiving Twitch chat logs using Native Slash Commands (`/chat`)
 Commands:
   /chat download <streamer> [vod_id]  - Download chats to archive and record metadata
   /chat track add/addfile/remove/show/scan   - Tracking list management
+  /chat logs download/days/scan       - Daily chat logs (logs.zonian.dev); `scan` batch-runs
+                                        the whole tracking list (same list as track scan)
   /chat migrate <category_ids_or_channel_ids> - Migrate old data to the dedup channel
   /chat repair [targets] [excludes]  - Scan and auto-repair incomplete chat files
   /chat status / list / sync / help  - Other
@@ -72,6 +74,7 @@ DESCRIPTION = (
     "`/chat repair [targets] [excludes]` - 欠落パーツのVODを検出し自動修復DL\n"
     "`/chat logs download <streamer>` - デイリーチャットログ(zonian)を1日ずつDL\n"
     "`/chat logs days <streamer>` - DL可能日数・保存状況を表示\n"
+    "`/chat logs scan` - トラッキングリスト全員のデイリーログを一括DL\n"
     "`/chat list [streamer]` - アップロード済みVOD一覧\n"
     "`/chat status` - Botステータス確認\n"
     "`/chat sync` - データベース手動同期\n"
@@ -2150,6 +2153,287 @@ async def slash_logs_days(interaction: discord.Interaction, channel: str, user: 
     lines.append(f"📥 DL: `/chat logs download channel:{channel_login}`")
 
     await bot._update_status(interaction, status_msg, "\n".join(lines))
+
+
+# --- /chat logs scan ---
+async def _collect_pending_days(
+    bot: "TwitchChatBot",
+    dedup_channel: discord.TextChannel,
+    channel_login: str,
+    days: list,
+    *,
+    user_filter: Optional[str] = None,
+    d_from=None,
+    d_to=None,
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> tuple[list, int, int]:
+    """
+    記録済み日のうち「確定済み / 期間内 / 未保存」の日を古い順に返す。
+
+    戻り値: (pending, skipped, incomplete)
+      pending    ... DL対象の日 (limit 適用済み)
+      skipped    ... 保存済みで飛ばした日数
+      incomplete ... まだ1日が終わっていない (対象外) 日数
+    """
+    now_utc = datetime.now(timezone.utc)
+    margin_h = get_safety_margin_hours()
+    complete = [d for d in days if day_is_complete(d, now=now_utc, margin_hours=margin_h)]
+    incomplete = len(days) - len(complete)
+
+    in_range = [
+        d for d in complete
+        if (d_from is None or d >= d_from) and (d_to is None or d <= d_to)
+    ]
+
+    pending: list = []
+    skipped = 0
+    for d in in_range:
+        log_id = make_log_id(channel_login, user_filter, d.isoformat())
+        if not force and await bot._is_log_uploaded_in_channel(dedup_channel, log_id):
+            skipped += 1
+        else:
+            pending.append(d)
+
+    if limit is not None:
+        pending = pending[:limit]
+    return pending, skipped, incomplete
+
+
+async def _logs_scan_body(
+    bot: "TwitchChatBot",
+    interaction: discord.Interaction,
+    sm: Optional[discord.Message],
+    entries: list[dict],
+    dest_channel: discord.TextChannel,
+    dedup_channel: discord.TextChannel,
+    progress: BatchProgress,
+    *,
+    user_filter: Optional[str] = None,
+    d_from=None,
+    d_to=None,
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> dict:
+    """
+    /chat logs scan の本体。`/chat track scan` と同じ枠組み (停滞監視 + .log 添付) で、
+    トラッキングリストに登録された配信者全員のデイリーチャットログ
+    (logs.zonian.dev) の未保存分を古い順にDLする。
+
+    - zonian API / Twitch API はいずれも同期 httpx なので to_thread で逃がす
+    - ログが見つからない (未記録) 配信者は警告だけ出して次へ進む
+    - 個別の失敗は progress.error() に溜めて続行し、最初の失敗時にログを投稿する
+    """
+    total_days, total_skip, total_err = 0, 0, 0
+    no_new, not_found = 0, 0
+    n = len(entries)
+
+    # 金庫チャンネルの履歴を最初に1回だけ舐めておく。これをやらないと人ごとの
+    # 重複判定のたびに history(limit=None) を読み直すことになる。
+    if not force:
+        progress.tick("重複金庫チャンネルの履歴をスキャン中")
+        try:
+            await bot._scan_channel_for_uploads(dedup_channel)
+        except Exception as e:
+            progress.note(f"⚠️ 金庫スキャン失敗 ({type(e).__name__}: {e}) -> ローカルDBのみで重複判定")
+
+    for i, entry in enumerate(entries):
+        login = str(entry.get("login", "")).lower().strip().lstrip("@")
+        if i > 0:
+            await asyncio.sleep(BATCH_ITEM_GAP_SECONDS)
+
+        progress.tick(f"({i+1}/{n}) {login}: 配信者情報を解決中")
+        sm = await bot._update_status(
+            interaction, sm, f"🔄 ({i+1}/{n}) `{login}` のデイリーログを確認中..."
+        )
+
+        try:
+            # 表示名の解決は飾りなので、失敗しても login のまま続行する
+            display, profile_img = login, None
+            ui: Optional[dict] = None
+            try:
+                ui = await asyncio.to_thread(bot.logger.resolve_streamer, login)
+            except Exception:
+                ui = None
+            if ui:
+                display = ui.get("displayName") or login
+                profile_img = ui.get("profileImageURL") or None
+                if ui.get("login"):
+                    login = ui["login"]
+
+            progress.tick(f"({i+1}/{n}) {login}: 記録日一覧を取得中")
+            info = await asyncio.to_thread(bot.zonian.get_available_days, login, user_filter)
+            channel_id = str(info.get("channel_id") or (ui or {}).get("id") or "")
+
+            progress.tick(f"({i+1}/{n}) {login}: 重複金庫と突合 ({info['days_count']}日)")
+            pending, skipped, incomplete = await _collect_pending_days(
+                bot, dedup_channel, login, info["days"],
+                user_filter=user_filter, d_from=d_from, d_to=d_to,
+                limit=limit, force=force,
+            )
+            total_skip += skipped
+
+            if not pending:
+                progress.note(
+                    f"{login}: 新ログなし (記録{info['days_count']}日 / "
+                    f"保存済{skipped}日 / 未終了{incomplete}日)"
+                )
+                no_new += 1
+                continue
+
+            progress.note(
+                f"{login}: 未DL {len(pending)}日発見 (記録{info['days_count']}日 / "
+                f"保存済{skipped}日 / 未終了{incomplete}日)"
+            )
+            await _notify(
+                interaction,
+                f"📋 `{login}` ({display}): 未DL **{len(pending)}日** 発見 -> {dest_channel.mention}"
+            )
+
+            for j, d in enumerate(pending):
+                progress.tick(
+                    f"({i+1}/{n}) {login}: {d:%Y-%m-%d} ({j+1}/{len(pending)}) DL中"
+                )
+                ok = await bot._process_day_log(
+                    interaction, login, display, channel_id, d,
+                    dest_channel=dest_channel, dedup_channel=dedup_channel,
+                    user_filter=user_filter, status_msg=sm, day_index=f"[{i+1}/{n}]",
+                    profile_img=profile_img,
+                )
+                if ok:
+                    total_days += 1
+                else:
+                    total_err += 1
+                if j < len(pending) - 1:
+                    await asyncio.sleep(BATCH_ITEM_GAP_SECONDS)
+
+        except LogsAPIError as e:
+            # まだどのインスタンスにも記録されていない etc. -> スキップして次へ
+            not_found += 1
+            progress.note(f"⚠️ {login}: {e}")
+            await _notify(interaction, f"⚠️ `{login}` をスキップ: {e}")
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[!] logs scan {login}: {tb}", file=sys.stderr)
+            progress.error(f"❌ {login} 処理中にエラー ({type(e).__name__})", e, tb)
+            total_err += 1
+            await _notify(
+                interaction,
+                f"❌ `{login}` 処理中にエラーが発生しました: {type(e).__name__}: {str(e)[:400]}"
+            )
+            # 最初の失敗時点でログを全文投稿しておく (途中で止まっても読めるように)
+            if len(progress.errors) == 1:
+                await bot._send_batch_log(interaction, progress, channel=interaction.channel)
+
+    return {
+        "ok": total_days, "skip": total_skip, "err": total_err, "people": n,
+        "no_new": no_new, "not_found": not_found,
+        "status_msg": sm,
+    }
+
+
+@logs_group.command(name="scan", description="トラッキングリスト全員のデイリーチャットログ(zonian)を一括DL")
+@app_commands.describe(
+    user="特定ユーザーの発言のみ抽出 (省略可 / 全員に適用)",
+    date_from="開始日 YYYY-MM-DD (UTC基準・省略可)",
+    date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
+    limit="1人あたりの最大DL日数 (省略時: 全件)",
+    force="重複チェックを無視して再DL (省略時: 無効)",
+)
+async def slash_logs_scan(
+    interaction: discord.Interaction,
+    user: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: Optional[int] = None,
+    force: bool = False,
+):
+    try:
+        if not interaction.guild: return
+        await interaction.response.defer()
+        bot = bot_instance
+        tracker_channel = await bot._get_or_create_tracker_channel(interaction.guild)
+        lst = await bot._load_track_list(tracker_channel)
+        if not lst:
+            return await interaction.followup.send(
+                "📭 リストが空です。先に `/chat track add` で登録してください。"
+            )
+
+        user_clean = (user or "").strip().lstrip("@") or None
+        try:
+            d_from = _parse_utc_date_param(date_from, "date_from") if date_from else None
+            d_to = _parse_utc_date_param(date_to, "date_to") if date_to else None
+        except ValueError as e:
+            return await interaction.followup.send(f"❌ {e}")
+        if d_from and d_to and d_from > d_to:
+            return await interaction.followup.send("❌ date_from が date_to より未来です。")
+        if limit is not None and limit < 1:
+            return await interaction.followup.send("❌ limit は1以上で指定してください。")
+
+        dest_channel = await bot._get_or_create_logs_archive_channel(interaction.guild)
+        dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
+        if not dest_channel or not dedup_channel:
+            return await interaction.followup.send("❌ 必要なチャンネルを取得できませんでした。")
+
+        u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
+        r_label = ""
+        if d_from or d_to:
+            r_label = f" / 期間: {d_from or '…'} 〜 {d_to or '…'}"
+        l_label = f" / 上限: 1人{limit}日" if limit is not None else ""
+
+        sm = await interaction.followup.send(
+            f"🔄 ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝ開始 ({len(lst)}人){u_label}{r_label}{l_label} 未DLの日を探します..."
+        )
+
+        started = time.time()
+        result = await bot._run_batch(
+            interaction,
+            title=f"logs_scan_{interaction.guild.name}",
+            status_msg=sm,
+            channel=interaction.channel,
+            body=lambda progress: _logs_scan_body(
+                bot, interaction, sm, lst, dest_channel, dedup_channel, progress,
+                user_filter=user_clean, d_from=d_from, d_to=d_to,
+                limit=limit, force=force,
+            ),
+        )
+        sm = result.get("status_msg", sm)
+
+        if result.get("aborted"):
+            await bot._update_status(
+                interaction, sm,
+                f"⛔ ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝ中断 ({_format_duration(int(time.time() - started))}経過)\n"
+                f"   進捗が止まったため打ち切りました。原因は添付ログ (.log) を確認してください。\n"
+                f"   よくある原因: 巨大な1日分の圧縮 / zonian API 無応答 / Discord API の長時間レート制限\n"
+                f"🆕{result.get('ok', 0)}日DL済 | ⏭️{result.get('skip', 0)}日ｽｷｯﾌﾟ\n"
+                f"   📂 本棚: {dest_channel.mention} | 重複金庫: {dedup_channel.mention}"
+            )
+            return
+
+        skip_note = f" / ⚠️{result.get('not_found', 0)}人 記録なし" if result.get("not_found") else ""
+        err_note = f" (詳細は添付ログ)" if result.get("err") else ""
+        await bot._update_status(
+            interaction, sm,
+            f"✅ ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝ完了! ({_format_duration(int(time.time() - started))})\n"
+            f"{result.get('people', len(lst))}人処理 / 新規なし{result.get('no_new', 0)}人{skip_note}\n"
+            f"🆕{result.get('ok', 0)}日DL / ⏭️{result.get('skip', 0)}日ｽｷｯﾌﾟ / ❌{result.get('err', 0)}日ｴラー{err_note}\n"
+            f"📂 本棚: {dest_channel.mention} | 重複金庫: {dedup_channel.mention}"
+        )
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # 起動準備 (チャンネル取得 / ﾄﾗｯｸﾘｽﾄ読込) の失敗も Discord に出す。
+        tb = traceback.format_exc()
+        print(f"[!] logs scan (setup): {tb}", file=sys.stderr)
+        await _notify(
+            interaction,
+            f"❌ ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝを開始できません: {type(e).__name__}: {str(e)[:400]}\n"
+            f"```\n{tb[-900:]}\n```"
+        )
 
 
 # --- /chat track add ---
