@@ -68,6 +68,11 @@ print("📅 デイリーログ (logs.zonian.dev) - Discord内コマンド:")
 print("  /chat logs download channel:配信者名")
 print("  /chat logs days channel:配信者名")
 print("  /chat logs scan                     <- トラッキングリスト全員を一括DL")
+print()
+print("📂 保存先チャンネル (1カテゴリー最大50チャンネル対策):")
+print("  dest:archive   -> VOD本棚 #twitch-chat-archives に同居保存")
+print("  dest:<チャンネルID> -> 任意のチャンネルへ")
+print("  (未指定でも専用チャンネルを作れなければ自動でVOD本棚へ)")
 '''
 
 

@@ -5,7 +5,8 @@ Commands:
   /chat download <streamer> [vod_id]  - Download chats to archive and record metadata
   /chat track add/addfile/remove/show/scan   - Tracking list management
   /chat logs download/days/scan       - Daily chat logs (logs.zonian.dev); `scan` batch-runs
-                                        the whole tracking list (same list as track scan)
+                                        the whole tracking list (same list as track scan).
+                                        `dest:` picks the archive channel (logs|archive|<id>)
   /chat migrate <category_ids_or_channel_ids> - Migrate old data to the dedup channel
   /chat repair [targets] [excludes]  - Scan and auto-repair incomplete chat files
   /chat status / list / sync / help  - Other
@@ -75,12 +76,15 @@ DESCRIPTION = (
     "`/chat logs download <streamer>` - デイリーチャットログ(zonian)を1日ずつDL\n"
     "`/chat logs days <streamer>` - DL可能日数・保存状況を表示\n"
     "`/chat logs scan` - トラッキングリスト全員のデイリーログを一括DL\n"
+    "`/chat logs download|scan dest:archive` - 保存先をVOD本棚に同居 (チャンネル数上限対策)\n"
     "`/chat list [streamer]` - アップロード済みVOD一覧\n"
     "`/chat status` - Botステータス確認\n"
     "`/chat sync` - データベース手動同期\n"
     "`/chat help` - ヘルプを表示\n\n"
     f"📌 **整理機能:** ログ本棚は `#{ARCHIVE_CHANNEL_NAME}`、回避用金庫は `#{DEDUP_CHANNEL_NAME}` に保存されます\n"
     f"📌 **デイリーログ:** zonianの1日1ファイルは `#{LOGS_ARCHIVE_CHANNEL_NAME}` に保存 (確定済みの日のみ)\n"
+    f"📌 **保存先の変更:** `dest:archive` でVOD本棚 `#{ARCHIVE_CHANNEL_NAME}` に同居保存 / "
+    f"`dest:<チャンネルID>` で任意のチャンネルへ (1カテゴリー最大50チャンネル対策)\n"
     f"📌 **データ整合性:** 履歴スキャンの遡りリミットは完全にオフ（無制限）です"
 )
 
@@ -594,6 +598,76 @@ class TwitchChatBot(commands.Bot):
         except Exception as e:
             print(f"[!] Failed to create tracker control channel: {e}")
             return None
+
+    # ---- デイリーログの保存先チャンネル解決 ----
+
+    async def _resolve_logs_dest_channel(
+        self,
+        guild: discord.Guild,
+        dest: Optional[str] = None,
+    ) -> tuple[Optional[discord.TextChannel], str]:
+        """
+        デイリーチャットログの保存先チャンネルを解決する。
+
+        dest (コマンド引数 > 環境変数 LOGS_DEST_CHANNEL > "logs"):
+          "logs" / "auto"          ... 専用チャンネル #twitch-logs-archives。
+                                       作成できない場合は VOD本棚 へ自動フォールバック
+          "archive" / "vod" / "same" ... VOD本棚 #twitch-chat-archives に同居保存
+          数値                      ... そのチャンネルIDのテキストチャンネルに保存
+
+        Discord は 1カテゴリーあたり最大50チャンネル (サーバー全体で500) なので、
+        配信者ごとのチャンネルが増えると専用チャンネルを作れなくなる。その場合でも
+        既存の本棚に同居させればDLを継続できるようにする。
+
+        戻り値: (channel, note)  note はDiscordへ出す補足文 (無ければ "")
+        """
+        pref = (dest or os.environ.get("LOGS_DEST_CHANNEL") or "logs").strip().lower()
+
+        # 1) チャンネルID直指定
+        if pref.isdigit():
+            ch = guild.get_channel(int(pref))
+            # カテゴリー/ボイス等には投稿できないので弾く (TextChannel / Thread はOK)
+            postable = (
+                ch is not None
+                and getattr(ch, "send", None) is not None
+                and not isinstance(ch, (discord.CategoryChannel, discord.VoiceChannel, discord.StageChannel))
+            )
+            if postable:
+                return ch, f"📌 保存先: 指定チャンネル {ch.mention}"
+            return None, (
+                f"❌ チャンネルID `{pref}` に保存できません "
+                f"(このサーバーのテキストチャンネルIDを指定してください)"
+            )
+
+        # 2) VOD本棚に同居
+        if pref in ("archive", "archives", "vod", "same", "vods"):
+            ch = await self._get_or_create_archive_channel(guild)
+            if ch:
+                return ch, f"📌 保存先: VOD本棚 {ch.mention} に同居保存します"
+            return None, "❌ VOD本棚チャンネルを取得・作成できませんでした。"
+
+        # 3) 専用チャンネル (既定)。作れなければ VOD本棚 へフォールバック
+        ch = await self._get_or_create_logs_archive_channel(guild)
+        if ch:
+            return ch, ""
+
+        fb = await self._get_or_create_archive_channel(guild)
+        if fb:
+            print(
+                f"[!] #{LOGS_ARCHIVE_CHANNEL_NAME} を作成できないため #{fb.name} へフォールバックします",
+                file=sys.stderr,
+            )
+            return fb, (
+                f"⚠️ 専用チャンネル `#{LOGS_ARCHIVE_CHANNEL_NAME}` を作成できませんでした "
+                f"(1カテゴリー最大50チャンネル / 権限不足の可能性)\n"
+                f"   → VOD本棚 {fb.mention} に同居保存します。"
+                f"今後も同居でよければ `dest:archive` を指定してください"
+            )
+        return None, (
+            "❌ 保存先チャンネルを取得・作成できませんでした。\n"
+            "   原因: カテゴリーのチャンネル数上限 (1カテゴリー最大50) / Botの管理権限不足\n"
+            "   対処: `dest:archive` でVOD本棚に同居させるか、`dest:<チャンネルID>` を指定してください"
+        )
 
     # ---- Channel dedup scanning ----
 
@@ -1943,6 +2017,7 @@ async def slash_download(interaction: discord.Interaction, streamer: str, vod_id
     date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
     limit="最大DL日数 (省略時: 全件)",
     force="重複チェックを無視して再DL (省略時: 無効)",
+    dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
 )
 async def slash_logs_download(
     interaction: discord.Interaction,
@@ -1952,6 +2027,7 @@ async def slash_logs_download(
     date_to: Optional[str] = None,
     limit: Optional[int] = None,
     force: bool = False,
+    dest: Optional[str] = None,
 ):
     if not interaction.guild:
         return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
@@ -1959,10 +2035,12 @@ async def slash_logs_download(
     await interaction.response.defer()
     bot = bot_instance
 
-    dest_channel = await bot._get_or_create_logs_archive_channel(interaction.guild)
+    dest_channel, dest_note = await bot._resolve_logs_dest_channel(interaction.guild, dest)
     dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
     if not dest_channel or not dedup_channel:
-        return await interaction.followup.send("❌ チャンネルの取得・作成に失敗しました。Botの管理権限を確認してください。")
+        return await interaction.followup.send(
+            dest_note or "❌ チャンネルの取得・作成に失敗しました。Botの管理権限を確認してください。"
+        )
 
     channel_clean = channel.lower().strip().lstrip("@")
     user_clean = (user or "").strip().lstrip("@") or None
@@ -1992,8 +2070,9 @@ async def slash_logs_download(
         pass
 
     u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
+    note_line = f"{dest_note}\n" if dest_note else ""
     status_msg = await interaction.followup.send(
-        f"🔎 `{display}` のデイリーログ情報を取得中... (ソース: logs.zonian.dev){u_label}"
+        f"{note_line}🔎 `{display}` のデイリーログ情報を取得中... (ソース: logs.zonian.dev){u_label}"
     )
 
     try:
@@ -2342,6 +2421,7 @@ async def _logs_scan_body(
     date_to="終了日 YYYY-MM-DD (UTC基準・省略可)",
     limit="1人あたりの最大DL日数 (省略時: 全件)",
     force="重複チェックを無視して再DL (省略時: 無効)",
+    dest="保存先 (logs=専用/archive=VOD本棚に同居/チャンネルID)",
 )
 async def slash_logs_scan(
     interaction: discord.Interaction,
@@ -2350,6 +2430,7 @@ async def slash_logs_scan(
     date_to: Optional[str] = None,
     limit: Optional[int] = None,
     force: bool = False,
+    dest: Optional[str] = None,
 ):
     try:
         if not interaction.guild: return
@@ -2373,10 +2454,12 @@ async def slash_logs_scan(
         if limit is not None and limit < 1:
             return await interaction.followup.send("❌ limit は1以上で指定してください。")
 
-        dest_channel = await bot._get_or_create_logs_archive_channel(interaction.guild)
+        dest_channel, dest_note = await bot._resolve_logs_dest_channel(interaction.guild, dest)
         dedup_channel = await bot._get_or_create_dedup_channel(interaction.guild)
         if not dest_channel or not dedup_channel:
-            return await interaction.followup.send("❌ 必要なチャンネルを取得できませんでした。")
+            return await interaction.followup.send(
+                dest_note or "❌ 必要なチャンネルを取得できませんでした。"
+            )
 
         u_label = f" / ﾕｰｻﾞｰ: `{user_clean}`" if user_clean else ""
         r_label = ""
@@ -2384,8 +2467,9 @@ async def slash_logs_scan(
             r_label = f" / 期間: {d_from or '…'} 〜 {d_to or '…'}"
         l_label = f" / 上限: 1人{limit}日" if limit is not None else ""
 
+        note_line = f"{dest_note}\n" if dest_note else ""
         sm = await interaction.followup.send(
-            f"🔄 ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝ開始 ({len(lst)}人){u_label}{r_label}{l_label} 未DLの日を探します..."
+            f"{note_line}🔄 ﾃﾞｲﾘｰﾛｸﾞｽｷｬﾝ開始 ({len(lst)}人){u_label}{r_label}{l_label} 未DLの日を探します..."
         )
 
         started = time.time()
