@@ -690,10 +690,23 @@ class TwitchChatBot(commands.Bot):
 
     async def _scan_channel_for_uploads(
         self, channel: discord.TextChannel, force_refresh: bool = False,
+        progress: Optional["BatchProgress"] = None,
     ) -> set[str]:
         cid = str(channel.id)
         if not force_refresh and cid in self._scan_cache:
             return self._scan_cache[cid]
+        # 同一チャンネルの全履歴スキャンが並行して走らないようにロック
+        locks = self.__dict__.setdefault("_scan_locks", {})
+        lock = locks.setdefault(cid, asyncio.Lock())
+        async with lock:
+            if not force_refresh and cid in self._scan_cache:
+                return self._scan_cache[cid]
+            return await self._scan_channel_for_uploads_locked(channel, progress)
+
+    async def _scan_channel_for_uploads_locked(
+        self, channel: discord.TextChannel, progress: Optional["BatchProgress"] = None,
+    ) -> set[str]:
+        cid = str(channel.id)
 
         vod_ids: set[str] = set()
         log_ids: set[str] = set()
@@ -701,7 +714,13 @@ class TwitchChatBot(commands.Bot):
         print(f"[~] Scanning #{channel.name} ({channel.guild.name}) history (limit=None)...")
 
         try:
+            scanned = 0
+            base_step = progress.step if progress is not None and hasattr(progress, "step") else None
             async for msg in channel.history(limit=None):
+                scanned += 1
+                if progress is not None and scanned % 100 == 0:
+                    # 長い履歴スキャン中もストール監視に生存を知らせる
+                    progress.throttle_tick(f"{base_step or '金庫スキャン'} — #{channel.name} 履歴 {scanned}件走査中")
                 meta = _find_metadata_in_content(msg.content)
                 if meta:
                     vod_ids.add(meta["vod_id"])
@@ -760,14 +779,17 @@ class TwitchChatBot(commands.Bot):
         await self._scan_channel_for_uploads(channel)
         return log_id in self._logs_scan_cache.get(cid, set())
 
-    async def _is_vod_uploaded_in_channel(self, channel: discord.TextChannel, vod_id: str) -> bool:
+    async def _is_vod_uploaded_in_channel(
+        self, channel: discord.TextChannel, vod_id: str,
+        progress: Optional["BatchProgress"] = None,
+    ) -> bool:
         cid = str(channel.id)
         if self.logger.db.is_uploaded(vod_id):
             if not self.logger.db.is_partial(vod_id):
                 return True
         if cid in self._scan_cache:
             return vod_id in self._scan_cache[cid]
-        uploaded = await self._scan_channel_for_uploads(channel)
+        uploaded = await self._scan_channel_for_uploads(channel, progress=progress)
         return vod_id in uploaded
 
     async def _sync_channel_to_db(self, channel: discord.TextChannel) -> int:
@@ -2922,7 +2944,10 @@ async def _track_scan_body(
 
             progress.note(f"{login}: VOD {len(all_vods)}件取得 -> 金庫チャンネルと突合")
             progress.tick(f"({i+1}/{n}) {login}: 重複金庫と突合 ({len(all_vods)}件)")
-            new_vods = [v for v in all_vods if not await bot._is_vod_uploaded_in_channel(dedup_channel, v["id"])]
+            # 金庫の全履歴スキャン (初回のみ) を先に済ませる。進捗を tick し続けるので
+            # 大きなチャンネルでもストール監視 (900s) に誤検知されない
+            await bot._scan_channel_for_uploads(dedup_channel, progress=progress)
+            new_vods = [v for v in all_vods if not await bot._is_vod_uploaded_in_channel(dedup_channel, v["id"], progress=progress)]
             if not new_vods:
                 progress.note(f"{login}: 新VODなし")
                 total_skip += 1
