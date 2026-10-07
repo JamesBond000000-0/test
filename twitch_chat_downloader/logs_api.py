@@ -1,8 +1,9 @@
 """
-Zonian Logs API Client - logs.zonian.dev ミラー経由で Twitch チャットの
-デイリーログ (justlog / rustlog インスタンス群) を取得するサービス。
+Twitch チャットの日別ログ取得クライアント。
+logs.zonian.dev を優先し、通信・HTTPエラー時は互換ミラーの Best Logs API
+(bestlogs.supa.codes) に自動フェイルオーバーする。
 
-API 仕様 (https://logs.zonian.dev/api):
+API 仕様 (https://logs.zonian.dev/api または https://bestlogs.supa.codes/api):
   - GET /api/{channel}[/{user}]          ... ログ記録済み日付の一覧 (メタデータ)
   - GET /channel/{ch}/{y}/{m}/{d}?json=true  ... 指定日(UTC)のチャンネル全体ログ
   - GET /channelid/{id}/{y}/{m}/{d}?json=true ... チャンネルID指定版
@@ -26,6 +27,9 @@ import httpx
 # ---- Constants / Configuration ----
 
 DEFAULT_BASE_URL = "https://logs.zonian.dev"
+# Best Logs API is a compatible secondary endpoint. Keep the root host here
+# (not /api), because request paths already include /api/ or /channel/.
+DEFAULT_FALLBACK_BASE_URL = "https://bestlogs.supa.codes"
 
 # 巨大な1日分 (実測で200MB超のJSONあり) のDL対策:
 # - read timeout は「データが完全に止まって」から諦めるまでの時間。
@@ -85,7 +89,14 @@ def get_zstd_level() -> int:
 
 
 def get_base_url() -> str:
-    return os.environ.get("LOGS_API_BASE", DEFAULT_BASE_URL).rstrip("/")
+    return os.environ.get("LOGS_API_BASE", DEFAULT_BASE_URL).strip().rstrip("/")
+
+
+def get_fallback_base_url() -> Optional[str]:
+    """Optional secondary API root. Set LOGS_API_FALLBACK_BASE= to disable."""
+    raw = os.environ.get("LOGS_API_FALLBACK_BASE", DEFAULT_FALLBACK_BASE_URL)
+    raw = raw.strip().rstrip("/")
+    return raw or None
 
 
 def get_safety_margin_hours() -> float:
@@ -96,7 +107,7 @@ def get_safety_margin_hours() -> float:
 
 
 class LogsAPIError(RuntimeError):
-    """logs.zonian.dev API のエラー。"""
+    """日別チャットログAPIのエラー。"""
 
 
 class LogsEmptyMismatchError(LogsAPIError):
@@ -151,10 +162,27 @@ def day_jst_range_text(day: date) -> str:
 
 
 class ZonianLogsClient:
-    """logs.zonian.dev ミラーAPI クライアント (同期版: 既存コードと同じスタイル)"""
+    """logs.zonian.dev + Best Logs fallback client (sync)."""
 
-    def __init__(self, base_url: Optional[str] = None, timeout: float = DEFAULT_TIMEOUT_SECONDS):
-        self.base_url = base_url or get_base_url()
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        fallback_base_url: Optional[str] = None,
+    ):
+        self.base_url = (base_url or get_base_url()).rstrip("/")
+        # An explicit empty env var disables failover. A constructor argument may
+        # also supply a fallback URL; None uses the env/default setting.
+        if fallback_base_url is None:
+            fallback_base_url = get_fallback_base_url()
+        self.fallback_base_url = (fallback_base_url or "").strip().rstrip("/") or None
+        if self.fallback_base_url == self.base_url:
+            self.fallback_base_url = None
+
+        self._base_urls = [self.base_url]
+        if self.fallback_base_url:
+            self._base_urls.append(self.fallback_base_url)
+        self._active_base_url = self.base_url
         self.timeout = timeout
         self._timeout_config = httpx.Timeout(
             connect=DEFAULT_CONNECT_TIMEOUT,
@@ -162,14 +190,20 @@ class ZonianLogsClient:
             write=60.0,
             pool=60.0,
         )
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            timeout=self._timeout_config,
-            headers={
-                "User-Agent": "twitch-chat-downloader/1.2 (Discord bot; daily chat logs)",
-                "Accept": "application/json",
-            },
-        )
+        headers = {
+            "User-Agent": "twitch-chat-downloader/1.2 (Discord bot; daily chat logs)",
+            "Accept": "application/json",
+        }
+        self._clients = {
+            url: httpx.Client(
+                base_url=url,
+                timeout=self._timeout_config,
+                headers=headers,
+            )
+            for url in self._base_urls
+        }
+        # Keep the old attribute as an alias for callers that may inspect it.
+        self._client = self._clients[self.base_url]
 
     # ---- Low-level ----
 
@@ -182,7 +216,13 @@ class ZonianLogsClient:
         """試行ごとにreadタイムアウトを段階的に伸ばす (巨大ファイル対策)。"""
         return self.timeout * (attempt + 1)
 
-    def _stream_get(self, path: str, read_timeout: float, progress_cb=None) -> tuple[int, bytes]:
+    def _stream_get(
+        self,
+        path: str,
+        read_timeout: float,
+        progress_cb=None,
+        base_url: Optional[str] = None,
+    ) -> tuple[int, bytes]:
         """
         GET をストリーミングで実行し、本文全体をバイト列で返す。
 
@@ -210,7 +250,8 @@ class ZonianLogsClient:
         deadline = started + max(DEFAULT_MAX_DOWNLOAD_SECONDS, read_timeout)
         received = 0
         last_log = started
-        with self._client.stream("GET", path, timeout=timeout_cfg) as resp:
+        client = self._clients.get(base_url or self._active_base_url, self._client)
+        with client.stream("GET", path, timeout=timeout_cfg) as resp:
             status = resp.status_code
             if status == 404:
                 resp.read()
@@ -240,30 +281,78 @@ class ZonianLogsClient:
 
     def _request(self, path: str, progress_cb=None) -> tuple[int, bytes]:
         """
-        リトライ (指数バックオフ) 付きGET。タイムアウト/接続エラー/429/5xxで再試行。
-        404 は即座に返す (データ無し = リトライ不要)。
+        GET with retries and immediate host failover.
 
-        戻り値: (status_code, body_bytes)
+        Try the currently preferred host first, then the other configured host
+        in the same round. A working fallback becomes preferred for subsequent
+        requests, avoiding a long timeout on every item in a large batch.
+        If every configured host returns 404, return 404 (no log on either API).
+
+        Returns: (status_code, body_bytes)
         """
         last_error: Optional[Exception] = None
+
         for attempt in range(DEFAULT_MAX_RETRIES + 1):
             read_timeout = self._read_timeout_for(attempt)
-            try:
-                return self._stream_get(path, read_timeout, progress_cb)
-            except (httpx.TimeoutException, httpx.TransportError, LogsAPIError) as e:
-                last_error = e
-                if attempt < DEFAULT_MAX_RETRIES:
-                    wait = self.retry_wait_seconds(attempt)
-                    print(
-                        f"[logs] {path} 失敗 ({e}) -> {wait:.0f}秒後に再試行 "
-                        f"({attempt+1}/{DEFAULT_MAX_RETRIES}) [timeout {read_timeout:.0f}s]"
+            ordered_bases = [self._active_base_url] + [
+                url for url in self._base_urls if url != self._active_base_url
+            ]
+            not_found: Optional[tuple[int, bytes]] = None
+            saw_error = False
+
+            for index, base_url in enumerate(ordered_bases):
+                try:
+                    status, body = self._stream_get(
+                        path, read_timeout, progress_cb, base_url=base_url
                     )
+                    if status == 404:
+                        # Another mirror may have this channel/day even when the
+                        # current one does not, so probe it before concluding.
+                        not_found = (status, body)
+                        if index < len(ordered_bases) - 1:
+                            print(f"[logs] {path}: HTTP 404 from {base_url}; trying fallback")
+                            continue
+                        continue
+
+                    if base_url != self._active_base_url:
+                        message = f"{path}: failover success -> {base_url}"
+                        print(f"[logs] {message}")
+                        if progress_cb is not None:
+                            try:
+                                progress_cb(message)
+                            except Exception:
+                                pass
+                    self._active_base_url = base_url
+                    return status, body
+
+                except (httpx.TimeoutException, httpx.TransportError, LogsAPIError) as e:
+                    saw_error = True
+                    last_error = e
+                    print(f"[logs] {path} via {base_url} failed: {e}")
                     if progress_cb is not None:
                         try:
-                            progress_cb(f"{path} ﾘﾄﾗｲ待機 {wait:.0f}s ({attempt+1}/{DEFAULT_MAX_RETRIES})")
+                            progress_cb(f"{path} via {base_url} failed: {type(e).__name__}")
                         except Exception:
                             pass
-                    time.sleep(wait)
+
+            # All configured hosts explicitly said the resource is absent.
+            # If one host errored, don't turn that mixed result into a false 404.
+            if not_found is not None and not saw_error:
+                return not_found
+
+            if attempt < DEFAULT_MAX_RETRIES:
+                wait = self.retry_wait_seconds(attempt)
+                print(
+                    f"[logs] {path} failed on all configured APIs -> {wait:.0f}s retry "
+                    f"({attempt+1}/{DEFAULT_MAX_RETRIES}) [timeout {read_timeout:.0f}s]"
+                )
+                if progress_cb is not None:
+                    try:
+                        progress_cb(f"{path} retry in {wait:.0f}s ({attempt+1}/{DEFAULT_MAX_RETRIES})")
+                    except Exception:
+                        pass
+                time.sleep(wait)
+
         raise LogsAPIError(f"APIリクエスト失敗: {path} ({last_error})")
 
     @staticmethod
@@ -423,7 +512,8 @@ class ZonianLogsClient:
         )
 
     def close(self):
-        self._client.close()
+        for client in self._clients.values():
+            client.close()
 
 
 # ---- Document building / compression / splitting ----
