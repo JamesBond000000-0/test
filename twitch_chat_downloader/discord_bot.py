@@ -445,6 +445,34 @@ def _find_log_metadata_in_content(content: str) -> dict | None:
 
 # ---- Bot class ----
 
+class StartupGateCommandTree(app_commands.CommandTree):
+    """Block slash-command execution until the startup dedup cache is prepared."""
+
+    async def interaction_check(self, interaction: discord.Interaction, /) -> bool:
+        # Autocomplete needs an autocomplete response, so do not try to send a
+        # normal ephemeral message from this gate. The command itself is still
+        # gated when the user submits it.
+        if interaction.type is discord.InteractionType.autocomplete:
+            return True
+
+        bot = self.client
+        if getattr(bot, "_startup_complete", False):
+            return True
+
+        step = getattr(bot, "_startup_step", "")
+        detail = f"\n現在の準備: {step}" if step else ""
+        message = (
+            "⏳ Bot起動時の準備中です。重複金庫の履歴を読み込み、"
+            f"重複防止キャッシュを作成しています。完了後に再実行してください。{detail}"
+        )
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message(message[:1900], ephemeral=True)
+            except discord.HTTPException:
+                pass
+        return False
+
+
 class TwitchChatBot(commands.Bot):
     """Discord bot for archiving Twitch chat logs using Slash Commands."""
 
@@ -453,6 +481,7 @@ class TwitchChatBot(commands.Bot):
         intents.message_content = True
         intents.guilds = True
 
+        kwargs.setdefault("tree_cls", StartupGateCommandTree)
         super().__init__(
             command_prefix="/",
             intents=intents,
@@ -466,6 +495,15 @@ class TwitchChatBot(commands.Bot):
         self._track_msg_cache: dict[str, int] = {}
         self._logs_scan_cache: dict[str, set[str]] = {}
         self._zonian: Optional[ZonianLogsClient] = None
+
+        # Discord application commands remain visible after sync, but the tree
+        # responds with a "preparing" notice until every joined guild's dedup
+        # history has been scanned and both in-memory caches are populated.
+        self._startup_complete = False
+        self._startup_step = "Discordへの接続を待っています"
+        self._startup_prepared_guild_ids: set[int] = set()
+        self._startup_scan_lock = asyncio.Lock()
+        self._startup_prepare_task: Optional[asyncio.Task] = None
 
     @property
     def zonian(self) -> ZonianLogsClient:
@@ -487,11 +525,111 @@ class TwitchChatBot(commands.Bot):
         print(f"[✓] Connected to {len(self.guilds)} guild(s)")
         for guild in self.guilds:
             print(f"    - {guild.name} (ID: {guild.id})")
-            await self._get_or_create_tracker_channel(guild)
-            await self._get_or_create_archive_channel(guild)
-            await self._get_or_create_dedup_channel(guild)
-            await self._get_or_create_logs_archive_channel(guild)
-        print("[✓] Slash commands ready! Type `/chat` in Discord to see commands.")
+
+        self._refresh_startup_ready()
+        if self._startup_complete:
+            print("[✓] Startup cache already prepared; slash commands are active.")
+            return
+
+        # on_ready can fire again after a gateway reconnect. Reuse an in-flight
+        # preparation task, and never rescan a guild already cached in memory.
+        if self._startup_prepare_task is None or self._startup_prepare_task.done():
+            self._startup_prepare_task = asyncio.create_task(self._prepare_startup_cache())
+        await self._startup_prepare_task
+
+        self._refresh_startup_ready()
+        if self._startup_complete:
+            print("[✓] Startup preparation complete; slash commands are now active.")
+        else:
+            pending = [g.name for g in self.guilds if g.id not in self._startup_prepared_guild_ids]
+            print(f"[!] Startup preparation incomplete; commands remain gated for: {', '.join(pending)}")
+
+    def _refresh_startup_ready(self) -> None:
+        """Open the command gate only after every currently joined guild was prepared."""
+        guild_ids = {guild.id for guild in self.guilds}
+        self._startup_complete = all(
+            guild_id in self._startup_prepared_guild_ids for guild_id in guild_ids
+        )
+
+    async def _prepare_startup_cache(self) -> None:
+        """Create required channels and pre-scan each dedup history at startup."""
+        self._startup_complete = False
+        guilds = list(self.guilds)
+        print(f"[~] Startup preparation: scanning dedup history for {len(guilds)} guild(s)")
+        for guild in guilds:
+            await self._prepare_guild_startup_cache(guild)
+        self._refresh_startup_ready()
+
+    async def _prepare_guild_startup_cache(self, guild: discord.Guild) -> None:
+        """Prepare one guild; serialized to avoid parallel history requests/rate limits."""
+        guild_id = guild.id
+        if guild_id in self._startup_prepared_guild_ids:
+            return
+
+        async with self._startup_scan_lock:
+            if guild_id in self._startup_prepared_guild_ids:
+                return
+
+            self._startup_complete = False
+            try:
+                self._startup_step = f"{guild.name}: チャンネルを準備中"
+                await self._get_or_create_tracker_channel(guild)
+                await self._get_or_create_archive_channel(guild)
+                dedup_channel = await self._get_or_create_dedup_channel(guild)
+                await self._get_or_create_logs_archive_channel(guild)
+
+                if dedup_channel is None:
+                    print(f"[!] Startup scan skipped for {guild.name}: dedup channel unavailable")
+                else:
+                    self._startup_step = f"{guild.name}: #{dedup_channel.name} の履歴をスキャン中"
+                    print(f"[~] Startup dedup scan: {guild.name} / #{dedup_channel.name}")
+                    await self._scan_channel_for_uploads(dedup_channel)
+
+                    cid = str(dedup_channel.id)
+                    if cid in self._scan_cache and cid in self._logs_scan_cache:
+                        print(
+                            f"[✓] Startup cache ready for {guild.name}: "
+                            f"{len(self._scan_cache[cid])} VOD IDs, "
+                            f"{len(self._logs_scan_cache[cid])} daily-log IDs"
+                        )
+                    else:
+                        # E.g. missing Read Message History permission. The attempt
+                        # is complete; commands can proceed using the existing DB path.
+                        print(
+                            f"[!] Startup history scan for {guild.name} did not fully "
+                            "populate the cache; commands will continue with normal DB checks."
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Do not permanently prevent command use because a single guild has
+                # a permission/API issue. It is logged and the command's normal
+                # fallback path can still operate after startup.
+                print(
+                    f"[!] Startup preparation failed for {guild.name}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+            finally:
+                self._startup_step = ""
+
+            # Mark the preparation attempt complete even if the scan had a soft
+            # failure; otherwise the command gate could remain closed forever.
+            self._startup_prepared_guild_ids.add(guild_id)
+            self._refresh_startup_ready()
+
+    async def on_guild_join(self, guild: discord.Guild):
+        """Prepare/cache a newly joined guild before allowing its commands."""
+        self._startup_complete = False
+        if not self.is_ready():
+            # Initial on_ready will include this guild in its startup pass.
+            return
+        await self._prepare_guild_startup_cache(guild)
+        self._refresh_startup_ready()
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        self._startup_prepared_guild_ids.discard(guild.id)
+        self._refresh_startup_ready()
 
     # ---- Dedicated Categories & Channels ----
 
@@ -718,9 +856,15 @@ class TwitchChatBot(commands.Bot):
             base_step = progress.step if progress is not None and hasattr(progress, "step") else None
             async for msg in channel.history(limit=None):
                 scanned += 1
-                if progress is not None and scanned % 100 == 0:
-                    # 長い履歴スキャン中もストール監視に生存を知らせる
-                    progress.throttle_tick(f"{base_step or '金庫スキャン'} — #{channel.name} 履歴 {scanned}件走査中")
+                if scanned % 100 == 0:
+                    # バッチ中はstall watchdogへheartbeatを送り、起動時はColab
+                    # コンソールに進捗を出す。Discordのratelimit sleep中は次の
+                    # メッセージが届くまでここは進まないため、startup gateを維持する。
+                    step_text = f"{base_step or '金庫スキャン'} — #{channel.name} 履歴 {scanned}件走査中"
+                    if progress is not None:
+                        progress.throttle_tick(step_text)
+                    else:
+                        print(f"[startup-scan] {step_text}", flush=True)
                 meta = _find_metadata_in_content(msg.content)
                 if meta:
                     vod_ids.add(meta["vod_id"])
