@@ -135,6 +135,17 @@ class ChatLoggerDB:
         ))
         self._conn.commit()
 
+    def get_upload(self, vod_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM uploads WHERE vod_id = ?", (vod_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        cols = [d[1] for d in self._conn.execute("PRAGMA table_info(uploads)").fetchall()]
+        d = dict(zip(cols, row))
+        d["discord_message_ids"] = json.loads(d.get("discord_message_ids") or "[]")
+        return d
+
     def get_uploads(
         self,
         streamer_login: str | None = None,
@@ -633,8 +644,11 @@ class ChatLogger:
                     "streamer_display_name": meta.get("sd", ""),
                     "stream_title": meta.get("title", ""),
                     "stream_date": meta.get("date", ""),
-                    "stream_start": meta.get("stream_start", ""),
-                    "stream_end": meta.get("stream_end", ""),
+                    # build_metadata_message は短いキー "start"/"end" で書く。
+                    # 以前は "stream_start"/"stream_end" を読んでいたため往復で
+                    # 常に欠落していた。旧形式の長キーもフォールバックで拾う。
+                    "stream_start": meta.get("start", meta.get("stream_start", "")),
+                    "stream_end": meta.get("end", meta.get("stream_end", "")),
                     "stream_duration_seconds": meta.get("dur", 0),
                     "total_comments": meta.get("n", 0),
                     "total_parts": meta.get("p", 1),
