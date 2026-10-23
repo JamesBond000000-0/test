@@ -443,6 +443,51 @@ def _find_log_metadata_in_content(content: str) -> dict | None:
     return None
 
 
+# ---- コマンド権限 ----
+# 破壊的・高負荷なコマンドは「オペレーター」限定にする (従来は権限チェックが
+# 一切なく、ギルドメンバー全員が repair / redownload / migrate 等を実行できた)。
+# オペレーター = 環境変数 BOT_OPERATOR_IDS に Discord ユーザーIDがある人、
+# またはそのサーバーのオーナー / 管理者・サーバー管理権限の保持者。
+# 閲覧系 (list / status / help / track show / logs days) はメンバー全員が使える。
+OPERATOR_ONLY_COMMANDS = {
+    "chat download",
+    "chat logs download",
+    "chat logs redownload",
+    "chat logs scan",
+    "chat track add",
+    "chat track addfile",
+    "chat track remove",
+    "chat track scan",
+    "chat repair",
+    "chat migrate",
+    "chat sync",
+}
+
+
+def _env_operator_ids() -> set[int]:
+    ids: set[int] = set()
+    for part in os.environ.get("BOT_OPERATOR_IDS", "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+def _is_chat_operator(interaction: discord.Interaction) -> bool:
+    user = interaction.user
+    if user is None:
+        return False
+    if user.id in _env_operator_ids():
+        return True
+    guild = interaction.guild
+    if guild is None:
+        return False
+    if guild.owner_id == user.id:
+        return True
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_guild))
+
+
 # ---- Bot class ----
 
 class StartupGateCommandTree(app_commands.CommandTree):
@@ -454,6 +499,36 @@ class StartupGateCommandTree(app_commands.CommandTree):
         # gated when the user submits it.
         if interaction.type is discord.InteractionType.autocomplete:
             return True
+
+        command = interaction.command
+        if command is not None:
+            # /chat はサーバー内専用に統一する (従来は list/status/help が DM でも
+            # 動き、status が保存先パスや件数を返していた)。
+            if interaction.guild is None:
+                if not interaction.response.is_done():
+                    try:
+                        await interaction.response.send_message(
+                            "❌ このコマンドはDiscordサーバー内でのみ実行できます。",
+                            ephemeral=True,
+                        )
+                    except discord.HTTPException:
+                        pass
+                return False
+            if (
+                command.qualified_name in OPERATOR_ONLY_COMMANDS
+                and not _is_chat_operator(interaction)
+            ):
+                if not interaction.response.is_done():
+                    try:
+                        await interaction.response.send_message(
+                            "⛔ このコマンドはBotのオペレーター "
+                            "(サーバーオーナー / 管理者権限 / BOT_OPERATOR_IDS 登録者) "
+                            "のみ実行できます。",
+                            ephemeral=True,
+                        )
+                    except discord.HTTPException:
+                        pass
+                return False
 
         bot = self.client
         if getattr(bot, "_startup_complete", False):
@@ -471,6 +546,35 @@ class StartupGateCommandTree(app_commands.CommandTree):
             except discord.HTTPException:
                 pass
         return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+        /,
+    ) -> None:
+        # interaction_check が False を返した場合は CheckFailure になる。
+        # 理由は check 側で ephemeral 表示済みなので、ここでは何もしない。
+        if isinstance(error, app_commands.CheckFailure):
+            return
+        print(
+            f"[!] app command error ({type(error).__name__}): {error}",
+            file=sys.stderr,
+        )
+        traceback.print_exception(
+            type(error), error, error.__traceback__, file=sys.stderr
+        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ コマンド実行中にエラーが発生しました。", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ コマンド実行中にエラーが発生しました。", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
 
 
 class TwitchChatBot(commands.Bot):
@@ -503,6 +607,13 @@ class TwitchChatBot(commands.Bot):
         self._startup_step = "Discordへの接続を待っています"
         self._startup_prepared_guild_ids: set[int] = set()
         self._startup_scan_lock = asyncio.Lock()
+        # バッチ処理 (scan / repair / download系フロー) の同時実行を防ぐ排他ロック。
+        # 重複判定が check-then-act のため、同時実行すると二重DL・二重UP・
+        # DB上書きが起こり得る。
+        self._batch_lock = asyncio.Lock()
+        # トラッキングリストの read-modify-write (load -> 変更 -> save) を
+        # 直列化し、同時 add/remove で片方の変更が消える lost update を防ぐ。
+        self._track_list_lock = asyncio.Lock()
         self._startup_prepare_task: Optional[asyncio.Task] = None
 
     @property
@@ -1037,6 +1148,40 @@ class TwitchChatBot(commands.Bot):
         return sent
 
     async def _run_batch(
+        self,
+        interaction: Optional[discord.Interaction],
+        *,
+        title: str,
+        body: Callable[[BatchProgress], Awaitable[dict]],
+        status_msg: Optional[discord.Message] = None,
+        channel: Optional[discord.abc.Messageable] = None,
+    ) -> dict:
+        """バッチの排他ラッパー。同時バッチを禁止し、重複判定の競合を防ぐ。"""
+        if self._batch_lock.locked():
+            if interaction is not None and status_msg is not None:
+                status_msg = await self._update_status(
+                    interaction, status_msg,
+                    "⚠️ 別のバッチ処理が実行中のため、このバッチは開始できませんでした。"
+                    "先の処理が終わってから再実行してください。",
+                )
+            elif channel is not None:
+                try:
+                    await channel.send(
+                        "⚠️ 別のバッチ処理が実行中のため、このバッチは開始できませんでした。"
+                    )
+                except Exception:
+                    pass
+            return {
+                "ok": False, "busy": True, "aborted": False,
+                "status_msg": status_msg,
+            }
+        async with self._batch_lock:
+            return await self._run_batch_locked(
+                interaction, title=title, body=body,
+                status_msg=status_msg, channel=channel,
+            )
+
+    async def _run_batch_locked(
         self,
         interaction: Optional[discord.Interaction],
         *,
@@ -1629,32 +1774,15 @@ class TwitchChatBot(commands.Bot):
             ),
         }
 
-    async def _purge_log_records(
+    async def _delete_log_messages(
         self,
         dedup_channel: discord.TextChannel,
         dest_channel: discord.TextChannel,
-        log_id: str,
+        row: dict | None,
+        msg_ids: list,
     ) -> int:
-        """
-        強制再DLの前に古い記録を消去する (誤った「ログなし」登録の修正用)。
-
-        - ローカル重複DBの行を削除
-        - インメモリキャッシュから削除
-        - 紐づくDiscordメッセージ (重複金庫の🔑エントリ / 本棚の📭・📅エントリ) を削除
-
-        戻り値: 削除できたDiscordメッセージ数
-        """
+        """指定メッセージID群を、記録チャンネル候補から探して削除する。"""
         deleted = 0
-
-        row = self.logger.db.get_log_upload(log_id)
-        msg_ids = list((row or {}).get("discord_message_ids") or [])
-        self.logger.db.remove_log_upload(log_id)
-        self.logger.db.remove_empty_check(log_id)
-
-        cid = str(dedup_channel.id)
-        cache = self._logs_scan_cache.get(cid)
-        if cache is not None:
-            cache.discard(log_id)
 
         # 探索候補チャンネル: 重複金庫 -> 保存先 -> ローカルDBに記録されたチャンネル
         candidates: list[discord.TextChannel] = [dedup_channel, dest_channel]
@@ -1690,6 +1818,66 @@ class TwitchChatBot(commands.Bot):
                 break
 
         return deleted
+
+    async def _purge_log_records(
+        self,
+        dedup_channel: discord.TextChannel,
+        dest_channel: discord.TextChannel,
+        log_id: str,
+    ) -> int:
+        """
+        強制再DLの前に古い記録を消去する (誤った「ログなし」登録の修正用)。
+
+        - ローカル重複DBの行を削除
+        - インメモリキャッシュから削除
+        - 紐づくDiscordメッセージ (重複金庫の🔑エントリ / 本棚の📭・📅エントリ) を削除
+
+        戻り値: 削除できたDiscordメッセージ数
+
+        注意: 現在の強制再DLフローは _replace_log_records (再取得の成功後に
+        旧メッセージだけを消す) を使っており、こちらは互換のために残している。
+        """
+        row = self.logger.db.get_log_upload(log_id)
+        msg_ids = list((row or {}).get("discord_message_ids") or [])
+        self.logger.db.remove_log_upload(log_id)
+        self.logger.db.remove_empty_check(log_id)
+
+        cid = str(dedup_channel.id)
+        cache = self._logs_scan_cache.get(cid)
+        if cache is not None:
+            cache.discard(log_id)
+
+        return await self._delete_log_messages(
+            dedup_channel, dest_channel, row, msg_ids
+        )
+
+    async def _replace_log_records(
+        self,
+        dedup_channel: discord.TextChannel,
+        dest_channel: discord.TextChannel,
+        log_id: str,
+        old_row: dict | None,
+    ) -> int:
+        """
+        強制再DLの成功後に、旧メッセージだけを削除する。
+
+        DB 行は _process_day_log の record_log_upload (INSERT OR REPLACE) で
+        置き換わっている前提で、行そのものは消さない。再DLが失敗した場合は
+        この関数自体が呼ばれないため、旧アーカイブはそのまま保持される
+        (以前の「先に消去してから再DL」では失敗時に旧記録まで失われていた)。
+
+        戻り値: 削除できたDiscordメッセージ数
+        """
+        old_ids = list((old_row or {}).get("discord_message_ids") or [])
+        if not old_ids:
+            return 0
+        new_row = self.logger.db.get_log_upload(log_id)
+        new_ids = set((new_row or {}).get("discord_message_ids") or [])
+        target_ids = [m for m in old_ids if m not in new_ids]
+        self.logger.db.remove_empty_check(log_id)
+        return await self._delete_log_messages(
+            dedup_channel, dest_channel, old_row, target_ids
+        )
 
     async def _process_day_log(
         self,
@@ -2167,6 +2355,13 @@ class TwitchChatBot(commands.Bot):
             await interaction.followup.send(chunk)
 
     async def _process_add_logins(self, interaction: discord.Interaction, logins: list, tracker_channel: discord.TextChannel, from_file: bool = False):
+        # トラックリストの read-modify-write を直列化する (lost update 防止)。
+        async with self._track_list_lock:
+            return await self._process_add_logins_impl(
+                interaction, logins, tracker_channel, from_file=from_file
+            )
+
+    async def _process_add_logins_impl(self, interaction: discord.Interaction, logins: list, tracker_channel: discord.TextChannel, from_file: bool = False):
         lst = await self._load_track_list(tracker_channel)
         added, skipped, not_found, errors = [], [], [], []
 
@@ -2252,6 +2447,21 @@ def _parse_utc_date_param(value: str, field_label: str):
 @chat_group.command(name="download", description="Twitch配信のチャットログをダウンロードして保管庫へ保存")
 @app_commands.describe(streamer="配信者のユーザー名 (Login ID)", vod_id="特定のVOD ID (省略した場合は古い順に未保存全件を取得)")
 async def slash_download(interaction: discord.Interaction, streamer: str, vod_id: Optional[str] = None):
+    # バッチ排他: 他のバッチ処理と同時に走らせると重複判定が競合するため、
+    # _run_batch と同じ _batch_lock で直列化する。
+    bot = bot_instance
+    if bot is not None and bot._batch_lock.locked():
+        return await interaction.response.send_message(
+            "⚠️ 別のバッチ処理が実行中です。終わってから再実行してください。",
+            ephemeral=True,
+        )
+    if bot is not None:
+        async with bot._batch_lock:
+            return await _slash_download_impl(interaction, streamer, vod_id)
+    return await _slash_download_impl(interaction, streamer, vod_id)
+
+
+async def _slash_download_impl(interaction: discord.Interaction, streamer: str, vod_id: Optional[str] = None):
     if not interaction.guild:
         return await interaction.response.send_message("❌ このコマンドはDiscordサーバー内でのみ実行できます。", ephemeral=True)
     
@@ -2347,6 +2557,35 @@ async def slash_download(interaction: discord.Interaction, streamer: str, vod_id
 # --- /chat logs download / redownload ---
 
 async def _logs_download_flow(
+    interaction: discord.Interaction,
+    channel: str,
+    user: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    limit: Optional[int],
+    force: bool,
+    dest: Optional[str],
+) -> None:
+    # バッチ排他: _run_batch を経由しない長時間フローのため、scan 系と同じ
+    # _batch_lock で直列化する (重複判定の競合防止)。
+    bot = bot_instance
+    if bot is not None and bot._batch_lock.locked():
+        await interaction.followup.send(
+            "⚠️ 別のバッチ処理が実行中です。終わってから再実行してください。",
+            ephemeral=True,
+        )
+        return
+    if bot is not None:
+        async with bot._batch_lock:
+            return await _logs_download_flow_impl(
+                interaction, channel, user, date_from, date_to, limit, force, dest
+            )
+    return await _logs_download_flow_impl(
+        interaction, channel, user, date_from, date_to, limit, force, dest
+    )
+
+
+async def _logs_download_flow_impl(
     interaction: discord.Interaction,
     channel: str,
     user: Optional[str],
@@ -2467,13 +2706,14 @@ async def _logs_download_flow(
     purged_total = 0
     for i, d in enumerate(pending):
         day_idx = f"[{i+1}/{total_new}]"
+        # 強制再DLは「再取得に成功してから旧メッセージを消す」順序にする。
+        # 先に消すと再DL失敗時に旧アーカイブまで失われるため、ここでは旧行の
+        # スナップショットだけを取り、削除は成功後に _replace_log_records で行う。
+        old_log_row = None
+        log_id = None
         if force:
-            # 再DLの前に古い記録 (重複金庫/本棚/ローカルDB) を消去して重複を防ぐ
             log_id = make_log_id(channel_login, user_clean, d.isoformat())
-            try:
-                purged_total += await bot._purge_log_records(dedup_channel, dest_channel, log_id)
-            except Exception as e:
-                print(f"[!] purge failed for {log_id}: {e}", file=sys.stderr)
+            old_log_row = bot.logger.db.get_log_upload(log_id)
         if await bot._process_day_log(
             interaction, channel_login, display, channel_id, d,
             dest_channel=dest_channel, dedup_channel=dedup_channel,
@@ -2481,6 +2721,13 @@ async def _logs_download_flow(
             profile_img=profile_img,
         ):
             ok_count += 1
+            if force:
+                try:
+                    purged_total += await bot._replace_log_records(
+                        dedup_channel, dest_channel, log_id, old_log_row
+                    )
+                except Exception as e:
+                    print(f"[!] replace-cleanup failed for {log_id}: {e}", file=sys.stderr)
         if i < len(pending) - 1:
             await asyncio.sleep(2.5)
 
@@ -2547,8 +2794,8 @@ async def slash_logs_redownload(
 
     await interaction.response.defer()
     await interaction.followup.send(
-        "🔁 **強制再DLモード** - 重複回避DBの記録を消去して再ダウンロードします。\n"
-        "└ 古い「ログなし」登録・アーカイブメッセージも消去の対象です。"
+        "🔁 **強制再DLモード** - 再ダウンロードします。\n"
+        "└ 成功した日は旧アーカイブと置き換わり、失敗した日は旧記録が保持されます。"
     )
     await _logs_download_flow(interaction, channel, user, date_from, date_to, limit, True, dest)
 
@@ -2773,13 +3020,13 @@ async def _logs_scan_body(
                 progress.tick(
                     f"({i+1}/{n}) {login}: {d:%Y-%m-%d} ({j+1}/{len(pending)}) DL中"
                 )
+                # 強制再DL: 旧行のスナップショットを取り、旧メッセージの削除は
+                # 再取得の成功後に行う (失敗時は旧アーカイブを保持する)。
+                old_log_row = None
+                log_id = None
                 if force:
-                    # 強制再DL: 古い記録 (重複金庫/本棚/ローカルDB) を消去してから再取得
                     log_id = make_log_id(login, user_filter, d.isoformat())
-                    try:
-                        await bot._purge_log_records(dedup_channel, dest_channel, log_id)
-                    except Exception as e:
-                        progress.note(f"⚠️ {login} {d:%Y-%m-%d}: 旧記録の消去に失敗 ({type(e).__name__}: {e})")
+                    old_log_row = bot.logger.db.get_log_upload(log_id)
                 ok = await bot._process_day_log(
                     interaction, login, display, channel_id, d,
                     dest_channel=dest_channel, dedup_channel=dedup_channel,
@@ -2788,6 +3035,13 @@ async def _logs_scan_body(
                 )
                 if ok:
                     total_days += 1
+                    if force:
+                        try:
+                            await bot._replace_log_records(
+                                dedup_channel, dest_channel, log_id, old_log_row
+                            )
+                        except Exception as e:
+                            progress.note(f"⚠️ {login} {d:%Y-%m-%d}: 旧メッセージの削除に失敗 ({type(e).__name__}: {e})")
                 else:
                     total_err += 1
                 if j < len(pending) - 1:
@@ -2893,6 +3147,9 @@ async def slash_logs_scan(
         )
         sm = result.get("status_msg", sm)
 
+        if result.get("busy"):
+            return
+
         if result.get("aborted"):
             await bot._update_status(
                 interaction, sm,
@@ -2973,11 +3230,13 @@ async def slash_track_remove(interaction: discord.Interaction, streamer: str):
     bot = bot_instance
     tracker_channel = await bot._get_or_create_tracker_channel(interaction.guild)
     login = streamer.lower().strip()
-    lst = await bot._load_track_list(tracker_channel)
-    new_lst = [e for e in lst if e["login"] != login]
-    if len(new_lst) == len(lst):
-        return await interaction.followup.send(f"❌ `{login}` はトラッキングリストに未登録です。")
-    await bot._save_track_list(tracker_channel, new_lst)
+    # read-modify-write を直列化し、同時 add との競合 (lost update) を防ぐ。
+    async with bot._track_list_lock:
+        lst = await bot._load_track_list(tracker_channel)
+        new_lst = [e for e in lst if e["login"] != login]
+        if len(new_lst) == len(lst):
+            return await interaction.followup.send(f"❌ `{login}` はトラッキングリストに未登録です。")
+        await bot._save_track_list(tracker_channel, new_lst)
     await interaction.followup.send(f"🗑️ `{login}` を削除しました！ (残り{len(new_lst)}人)")
 
 
@@ -3056,7 +3315,18 @@ async def _track_scan_body(
                     if new_login and new_login != login:
                         entry["login"] = new_login
                         entry["display_name"] = ui.get("displayName", new_login)
-                        await bot._save_track_list(tracker_channel, entries)
+                        # 保存はロック内で最新リストを読み直してから行い、
+                        # スキャン中に別途行われた add/remove を消さないようにする。
+                        async with bot._track_list_lock:
+                            fresh = await bot._load_track_list(tracker_channel)
+                            for fe in fresh:
+                                if fe.get("login") == login and (
+                                    not user_id or fe.get("user_id") == user_id
+                                ):
+                                    fe["login"] = new_login
+                                    fe["display_name"] = ui.get("displayName", new_login)
+                                    break
+                            await bot._save_track_list(tracker_channel, fresh)
                         login = new_login
             if not ui:
                 progress.note(f"⚠️ {login}: 解決不能のためスキップ")
@@ -3156,6 +3426,9 @@ async def slash_track_scan(interaction: discord.Interaction):
             ),
         )
         sm = result.get("status_msg", sm)
+
+        if result.get("busy"):
+            return
 
         if result.get("aborted"):
             await bot._update_status(
@@ -3331,6 +3604,9 @@ async def slash_repair(interaction: discord.Interaction, targets: str = "default
     )
     status_msg = result.get("status_msg", status_msg)
 
+    if result.get("busy"):
+        return
+
     if result.get("aborted"):
         return await bot._update_status(
             interaction, status_msg,
@@ -3370,17 +3646,11 @@ async def _repair_body(
         progress.tick(f"({idx}/{total}) {vod_id} 修復準備 ({info['streamer_login']})")
         status_msg = await bot._update_status(interaction, status_msg, f"{prefix} VOD `{vod_id}` ({info['streamer_display_name']}) の修復準備中...")
 
-        for ch, old_msg in archive_messages.get(vod_id, []):
-            try: await old_msg.delete()
-            except Exception: pass
-        try:
-            dedup_msg = await dedup_channel.fetch_message(info["dedup_msg_id"])
-            await dedup_msg.delete()
-        except Exception: pass
-
-        bot.logger.db.remove_upload(vod_id)
-        if str(dedup_channel.id) in bot._scan_cache:
-            bot._scan_cache[str(dedup_channel.id)].discard(vod_id)
+        # 修復は「再取得に成功してから旧データを消す」順序にする。
+        # 以前は先に旧メッセージと DB 行を消してから再DLしていたため、再DLが
+        # 失敗 (VOD期限切れ・障害) すると元のアーカイブまで失われていた。
+        old_row = bot.logger.db.get_upload(vod_id)
+        old_uploaded_at = (old_row or {}).get("uploaded_at")
 
         try:
             success = await bot._process_vod(
@@ -3398,6 +3668,24 @@ async def _repair_body(
             if len(progress.errors) == 1:
                 await bot._send_batch_log(interaction, progress, channel=interaction.channel)
             success = False
+
+        # 新しいアップロードが DB に記録された場合のみ、旧データを消す。
+        # record_upload は INSERT OR REPLACE で uploaded_at が更新されるため、
+        # その変化で「置き換わった」ことを判定できる。
+        new_row = bot.logger.db.get_upload(vod_id)
+        replaced = bool(new_row) and new_row.get("uploaded_at") != old_uploaded_at
+        if replaced:
+            for ch, old_msg in archive_messages.get(vod_id, []):
+                try: await old_msg.delete()
+                except Exception: pass
+            dedup_msg_id = info.get("dedup_msg_id")
+            if dedup_msg_id:
+                try:
+                    dedup_msg = await dedup_channel.fetch_message(dedup_msg_id)
+                    await dedup_msg.delete()
+                except Exception: pass
+        elif not success:
+            progress.note(f"⚠️ {vod_id} 再取得できなかったため旧アーカイブを保持しました")
 
         if success:
             repaired_count += 1
